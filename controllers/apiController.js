@@ -39,6 +39,7 @@ const ytDlClient = createRapidClient(
   process.env.YT_DL_BASEURL || process.env.YT_API_BASEURL,
   process.env.YT_DL_HOST || process.env.YT_API_HOST
 );
+const ytVideoClient = createRapidClient(process.env.YT_VIDEO_API_BASEURL, process.env.YT_VIDEO_API_HOST);
 const shazamClient = createRapidClient(process.env.SHAZAM_API_BASEURL, process.env.SHAZAM_API_HOST);
 
 function pickFirstUrl(value) {
@@ -329,6 +330,82 @@ async function convertToMp3(inputBuf, inputExtHint = 'mp4') {
   }
 }
 
+function pickQualities(data) {
+  const video =
+    data?.video ||
+    data?.videos ||
+    data?.videoQualities ||
+    data?.video_qualities ||
+    data?.result?.video ||
+    data?.result?.videos ||
+    data?.data?.video ||
+    data?.data?.videos ||
+    [];
+  const audio =
+    data?.audio ||
+    data?.audios ||
+    data?.audioQualities ||
+    data?.audio_qualities ||
+    data?.result?.audio ||
+    data?.result?.audios ||
+    data?.data?.audio ||
+    data?.data?.audios ||
+    [];
+  return { video, audio };
+}
+
+function normalizeQualityList(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((x) => {
+      if (x == null) return null;
+      if (typeof x === 'number' || typeof x === 'string') return { id: String(x), label: String(x) };
+      if (typeof x === 'object') {
+        const id = x.id || x.itag || x.quality || x.value || x.code;
+        const label = x.label || x.name || x.qualityLabel || x.quality_label || x.resolution || x.quality;
+        return id ? { id: String(id), label: label ? String(label) : String(id) } : null;
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+async function getYouTubeQualityOptions(videoId) {
+  requireRapidApiKey();
+  requireBase(process.env.YT_VIDEO_API_BASEURL, 'YT_VIDEO_API_BASEURL');
+  const tpl = process.env.YT_VIDEO_QUALITIES_PATH || '/get_available_quality/{id}';
+  const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
+  const res = await ytVideoClient.get(pathUrl, { params: { response_mode: 'default' } });
+  const { video, audio } = pickQualities(res.data);
+  return {
+    video: normalizeQualityList(video),
+    audio: normalizeQualityList(audio),
+    raw: res.data
+  };
+}
+
+async function downloadYouTubeVideoByQuality(videoId, quality) {
+  requireRapidApiKey();
+  requireBase(process.env.YT_VIDEO_API_BASEURL, 'YT_VIDEO_API_BASEURL');
+  const tpl = process.env.YT_VIDEO_DOWNLOAD_PATH || '/download_video/{id}';
+  const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
+  const res = await ytVideoClient.get(pathUrl, { params: { quality } });
+  const url = pickFirstUrl(res.data?.url) || pickFirstUrl(res.data?.link) || pickFirstUrl(res.data?.data) || pickFirstUrl(res.data);
+  if (!url) throw new Error('Video download API returned no URL');
+  return { url, raw: res.data };
+}
+
+async function downloadYouTubeAudioByQuality(videoId, quality) {
+  requireRapidApiKey();
+  requireBase(process.env.YT_VIDEO_API_BASEURL, 'YT_VIDEO_API_BASEURL');
+  const tpl = process.env.YT_VIDEO_AUDIO_PATH || '/download_audio/{id}';
+  const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
+  const res = await ytVideoClient.get(pathUrl, { params: { quality } });
+  const url = pickFirstUrl(res.data?.url) || pickFirstUrl(res.data?.link) || pickFirstUrl(res.data?.data) || pickFirstUrl(res.data);
+  if (!url) throw new Error('Audio download API returned no URL');
+  return { url, raw: res.data };
+}
+
 async function recognizeSongFromAudioUrl(audioUrl) {
   requireRapidApiKey();
   requireBase(process.env.SHAZAM_API_BASEURL, 'SHAZAM_API_BASEURL');
@@ -416,5 +493,8 @@ module.exports = {
   downloadAllMedia,
   searchYouTube,
   downloadYouTubeMp3,
+  getYouTubeQualityOptions,
+  downloadYouTubeVideoByQuality,
+  downloadYouTubeAudioByQuality,
   recognizeSongFromAudioUrl
 };

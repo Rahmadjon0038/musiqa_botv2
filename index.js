@@ -14,6 +14,9 @@ const {
   downloadAllMedia,
   searchYouTube,
   downloadYouTubeMp3,
+  getYouTubeQualityOptions,
+  downloadYouTubeVideoByQuality,
+  downloadYouTubeAudioByQuality,
   recognizeSongFromAudioUrl
 } = require('./controllers/apiController');
 
@@ -155,34 +158,54 @@ async function handleMediaLink(ctx, url) {
     }
 
     if (isYouTube) {
+      const videoId = extractYouTubeId(url);
+      if (videoId) {
+        try {
+          const opts = await getYouTubeQualityOptions(videoId);
+          const videoQualities = (opts.video || []).slice(0, 12);
+          const audioQualities = opts.audio || [];
+
+          const videoButtons = videoQualities.map((q) => {
+            const label = `🎬 ${labelFromQualityId(q.id)} ⬇️`;
+            const token = putAction({ kind: 'ytvideo', id: videoId, quality: q.id });
+            return Markup.button.callback(label, `yv:${token}`);
+          });
+
+          const preferredAudio =
+            audioQualities.find((a) => String(a.id) === '251') ||
+            audioQualities.find((a) => String(a.id) === '140') ||
+            audioQualities[0] ||
+            null;
+
+          const keyboardRows = [];
+          for (const row of chunk(videoButtons, 2)) keyboardRows.push(row);
+          if (preferredAudio) {
+            const at = putAction({ kind: 'ytaudio2', id: videoId, quality: preferredAudio.id, title: title || null });
+            keyboardRows.push([Markup.button.callback("🎵 Audioni yuklab olish", `ya2:${at}`)]);
+          }
+
+          const header = title ? `🍿 ${title}` : 'YouTube video';
+          const text = [header, url, '', BRAND_FOOTER].filter(Boolean).join('\n');
+          await ctx.reply(text, Markup.inlineKeyboard(keyboardRows));
+          return;
+        } catch (e) {
+          console.error('YT quality options failed, falling back:', e?.response?.data || e?.message || e);
+        }
+      }
+
+      // Fallback: old behavior from universal downloader response.
       const yt = extractYouTubeOptions(raw);
       const videoButtons = buildYouTubeVideoButtons(yt.videos || [], videoUrl || null);
-      const videoId = extractYouTubeId(url);
-      const audioButton = videoId
-        ? Markup.button.callback(
-            "🎵 Audioni yuklab olish",
-            `ya:${putAction({ kind: 'ytaudio', id: videoId, title: title || null })}`
-          )
-        : yt.audioUrl
-          ? Markup.button.callback(
-              "🎵 Audioni yuklab olish",
-              `dl:a:${putAction({ kind: 'audio', url: yt.audioUrl })}`
-            )
-          : audioUrl
-            ? Markup.button.callback(
-                "🎵 Audioni yuklab olish",
-                `dl:a:${putAction({ kind: 'audio', url: audioUrl })}`
-              )
-            : null;
+      const audioButton = audioUrl
+        ? Markup.button.callback("🎵 Audioni yuklab olish", `dl:a:${putAction({ kind: 'audio', url: audioUrl })}`)
+        : null;
 
       const keyboardRows = [];
       for (const row of chunk(videoButtons, 2)) keyboardRows.push(row);
       if (audioButton) keyboardRows.push([audioButton]);
 
-      const duration = yt.duration ? `⏱ ${yt.duration}` : null;
       const header = title ? `🍿 ${title}` : 'YouTube video';
-      const text = [header, duration, url, '', BRAND_FOOTER].filter(Boolean).join('\n');
-
+      const text = [header, url, '', BRAND_FOOTER].filter(Boolean).join('\n');
       await ctx.reply(text, Markup.inlineKeyboard(keyboardRows));
       return;
     }
@@ -276,6 +299,30 @@ function extractYouTubeId(inputUrl) {
     // ignore
   }
   return null;
+}
+
+function labelFromQualityId(id) {
+  const map = {
+    160: '144p',
+    133: '240p',
+    134: '360p',
+    135: '480p',
+    136: '720p',
+    137: '1080p',
+    247: '720p',
+    248: '1080p',
+    243: '360p',
+    244: '480p',
+    245: '480p',
+    246: '480p',
+    249: 'Audio',
+    250: 'Audio',
+    251: 'Audio',
+    140: 'Audio'
+  };
+  const n = Number(id);
+  if (Number.isFinite(n) && map[n]) return map[n];
+  return String(id);
 }
 
 function extractYouTubeOptions(raw) {
@@ -793,6 +840,61 @@ bot.action(/^ya:(.+)$/, async (ctx) => {
     await sendTelegramMedia(ctx, 'audio', mp3Url, caption);
   } catch (err) {
     console.error('youtube audio download error:', err?.response?.data || err?.message || err);
+    await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
+  }
+});
+
+bot.action(/^yv:(.+)$/, async (ctx) => {
+  const token = ctx.match?.[1];
+  const entry = getAction(token);
+  if (!entry || entry.kind !== 'ytvideo' || !entry.id || !entry.quality) {
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  try {
+    await ctx.answerCbQuery('Video tayyorlanyapti…');
+  } catch {
+    // ignore
+  }
+
+  try {
+    const { url } = await downloadYouTubeVideoByQuality(entry.id, entry.quality);
+    await sendTelegramMedia(ctx, 'video', url, BRAND_FOOTER, undefined, labelFromQualityId(entry.quality));
+  } catch (err) {
+    console.error('youtube video download error:', err?.response?.data || err?.message || err);
+    await ctx.reply("Video yuklab bo‘lmadi. Boshqa sifatni tanlang.");
+  }
+});
+
+bot.action(/^ya2:(.+)$/, async (ctx) => {
+  const token = ctx.match?.[1];
+  const entry = getAction(token);
+  if (!entry || entry.kind !== 'ytaudio2' || !entry.id || !entry.quality) {
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  try {
+    await ctx.answerCbQuery('Audio tayyorlanyapti…');
+  } catch {
+    // ignore
+  }
+
+  try {
+    const { url } = await downloadYouTubeAudioByQuality(entry.id, entry.quality);
+    const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
+    await sendTelegramMedia(ctx, 'audio', url, caption);
+  } catch (err) {
+    console.error('youtube audio (quality) error:', err?.response?.data || err?.message || err);
     await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
   }
 });
