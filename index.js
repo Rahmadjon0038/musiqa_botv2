@@ -793,7 +793,13 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
       timeout: 60_000,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
-      headers: { 'User-Agent': 'Mozilla/5.0' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        // Some CDNs block unknown clients; these headers help for googlevideo/tiktokcdn style URLs.
+        Referer: 'https://www.youtube.com/',
+        Origin: 'https://www.youtube.com'
+      },
+      maxRedirects: 5
     });
 
     const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
