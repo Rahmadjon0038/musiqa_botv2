@@ -906,7 +906,9 @@ bot.action(/^yv:(.+)$/, async (ctx) => {
 
   try {
     const { url } = await downloadYouTubeVideoByQuality(entry.id, entry.quality);
-    await sendTelegramMedia(ctx, 'video', url, BRAND_FOOTER, undefined, labelFromQualityId(entry.quality));
+    console.log('YT video download:', { id: entry.id, quality: entry.quality, url });
+    const qLabel = labelFromQualityId(entry.quality);
+    await sendTelegramMedia(ctx, 'video', url, `${qLabel}\n${BRAND_FOOTER}`, undefined, qLabel);
   } catch (err) {
     console.error('youtube video download error:', err?.response?.data || err?.message || err);
     await ctx.reply("Video yuklab bo‘lmadi. Boshqa sifatni tanlang.");
