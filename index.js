@@ -347,13 +347,23 @@ function extractYouTubeOptions(raw) {
   }
 
   visit(formats);
-  visit(raw);
 
   const videos = [];
-  for (const c of candidates) {
+  // Prefer likely-direct media URLs first.
+  const scored = candidates
+    .map((c) => ({
+      ...c,
+      score:
+        (c.url.includes('googlevideo.com') ? 5 : 0) +
+        (c.url.includes('.mp4') ? 2 : 0) +
+        (c.mime && String(c.mime).includes('video') ? 1 : 0) +
+        (c.size ? 1 : 0)
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  for (const c of scored) {
     if (!c.height) continue;
-    const key = `${c.height}:${c.url}`;
-    if (key && videos.some((v) => v.height === c.height)) continue;
+    if (videos.some((v) => v.height === c.height)) continue;
     videos.push(c);
   }
 
@@ -390,9 +400,13 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
   }
 
   const out = [];
+  const usedUrls = new Set();
   for (const h of preferred) {
     const v = byHeight.get(h);
     if (!v) continue;
+    // If API gives the same URL for many qualities, show it once.
+    if (usedUrls.has(v.url)) continue;
+    usedUrls.add(v.url);
     const approx = sizeToApproxMb(v.size);
     const label = `🎬 ${h}p ⬇️${approx ? ` ${approx}` : ''}`;
     out.push(
@@ -412,6 +426,8 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
   if (!out.length) {
     const top = (videos || []).slice(0, 6);
     for (const v of top) {
+      if (usedUrls.has(v.url)) continue;
+      usedUrls.add(v.url);
       const label = `🎬 ${v.height || '?'}p ⬇️`;
       out.push(
         Markup.button.callback(
