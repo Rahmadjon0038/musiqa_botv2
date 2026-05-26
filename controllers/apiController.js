@@ -403,9 +403,24 @@ function normalizeQualityList(list) {
       if (x == null) return null;
       if (typeof x === 'number' || typeof x === 'string') return { id: String(x), label: String(x) };
       if (typeof x === 'object') {
-        const id = x.id || x.itag || x.quality || x.value || x.code;
-        const label = x.label || x.name || x.qualityLabel || x.quality_label || x.resolution || x.quality;
-        return id ? { id: String(id), label: label ? String(label) : String(id) } : null;
+        const id = x.id || x.itag || x.value || x.code;
+        const label =
+          x.quality ||
+          x.label ||
+          x.name ||
+          x.qualityLabel ||
+          x.quality_label ||
+          x.resolution ||
+          (id ? String(id) : null);
+        return id
+          ? {
+              id: String(id),
+              label: label ? String(label) : String(id),
+              size: x.size ?? x.filesize ?? x.fileSize ?? null,
+              mime: x.mime ?? x.mimeType ?? x.type ?? null,
+              bitrate: x.bitrate ?? null
+            }
+          : null;
       }
       return null;
     })

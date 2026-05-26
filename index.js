@@ -158,16 +158,16 @@ async function handleMediaLink(ctx, url) {
     }
 
     if (isYouTube) {
-      const videoId = extractYouTubeId(url);
+          const videoId = extractYouTubeId(url);
       if (videoId) {
         try {
           const opts = await getYouTubeQualityOptions(videoId);
-          const videoQualities = (opts.video || []).slice(0, 12);
+          const videoQualities = pickBestPerQuality(opts.video || []).slice(0, 12);
           const audioQualities = opts.audio || [];
 
           const videoButtons = videoQualities.map((q) => {
             const friendly = q.label && q.label !== q.id ? q.label : labelFromQualityId(q.id);
-            const label = `🎬 ${friendly} ⬇️`;
+            const label = `🎬 ${friendly} ⬇️${approxFromBytes(q.size)}`;
             const token = putAction({ kind: 'ytvideo', id: videoId, quality: q.id });
             return Markup.button.callback(label, `yv:${token}`);
           });
@@ -330,6 +330,41 @@ function labelFromQualityId(id) {
   const n = Number(id);
   if (Number.isFinite(n) && map[n]) return map[n];
   return String(id);
+}
+
+function approxFromBytes(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const mb = n / (1024 * 1024);
+  return ` ~${Math.round(mb)}MB`;
+}
+
+function pickBestPerQuality(list) {
+  const byQ = new Map();
+  for (const item of list || []) {
+    const q = String(item?.label || '').trim();
+    if (!q) continue;
+    if (!byQ.has(q)) {
+      byQ.set(q, item);
+      continue;
+    }
+    const cur = byQ.get(q);
+    const curMime = String(cur?.mime || '').toLowerCase();
+    const nextMime = String(item?.mime || '').toLowerCase();
+    const curScore =
+      (curMime.includes('mp4') ? 2 : 0) + (curMime.includes('avc1') ? 2 : 0) + (Number(cur?.size) ? 1 : 0);
+    const nextScore =
+      (nextMime.includes('mp4') ? 2 : 0) + (nextMime.includes('avc1') ? 2 : 0) + (Number(item?.size) ? 1 : 0);
+    if (nextScore > curScore) byQ.set(q, item);
+  }
+
+  return [...byQ.entries()]
+    .sort((a, b) => {
+      const an = Number(a[0].replace(/[^0-9]/g, '')) || 0;
+      const bn = Number(b[0].replace(/[^0-9]/g, '')) || 0;
+      return an - bn;
+    })
+    .map(([, v]) => v);
 }
 
 function extractYouTubeOptions(raw) {
