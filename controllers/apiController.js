@@ -331,6 +331,7 @@ async function convertToMp3(inputBuf, inputExtHint = 'mp4') {
 }
 
 function pickQualities(data) {
+  // Try common shapes first.
   const video =
     data?.video ||
     data?.videos ||
@@ -340,7 +341,7 @@ function pickQualities(data) {
     data?.result?.videos ||
     data?.data?.video ||
     data?.data?.videos ||
-    [];
+    null;
   const audio =
     data?.audio ||
     data?.audios ||
@@ -350,8 +351,39 @@ function pickQualities(data) {
     data?.result?.audios ||
     data?.data?.audio ||
     data?.data?.audios ||
-    [];
-  return { video, audio };
+    null;
+
+  if (Array.isArray(video) || Array.isArray(audio)) {
+    return { video: Array.isArray(video) ? video : [], audio: Array.isArray(audio) ? audio : [] };
+  }
+
+  // Fallback: deep-scan for arrays under keys that include 'video'/'audio' and 'quality'.
+  const found = { video: [], audio: [] };
+  const seen = new Set();
+
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) return;
+
+    for (const [k, v] of Object.entries(node)) {
+      const key = String(k).toLowerCase();
+      if (Array.isArray(v)) {
+        if (key.includes('video') && (key.includes('quality') || key.includes('qualities') || key.includes('available'))) {
+          found.video = v;
+        }
+        if (key.includes('audio') && (key.includes('quality') || key.includes('qualities') || key.includes('available'))) {
+          found.audio = v;
+        }
+      } else if (v && typeof v === 'object') {
+        visit(v);
+      }
+    }
+  }
+
+  visit(data);
+  return found;
 }
 
 function normalizeQualityList(list) {

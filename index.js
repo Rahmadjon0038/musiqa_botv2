@@ -184,6 +184,11 @@ async function handleMediaLink(ctx, url) {
             keyboardRows.push([Markup.button.callback("🎵 Audioni yuklab olish", `ya2:${at}`)]);
           }
 
+          if (!keyboardRows.length) {
+            await ctx.reply("Bu videoda formatlar topilmadi. Boshqa YouTube link yuboring yoki keyinroq urinib ko‘ring.");
+            return;
+          }
+
           const header = title ? `🍿 ${title}` : 'YouTube video';
           const text = [header, url, '', BRAND_FOOTER].filter(Boolean).join('\n');
           await ctx.reply(text, Markup.inlineKeyboard(keyboardRows));
