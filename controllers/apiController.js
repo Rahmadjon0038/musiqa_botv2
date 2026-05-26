@@ -331,6 +331,13 @@ async function convertToMp3(inputBuf, inputExtHint = 'mp4') {
 }
 
 function pickQualities(data) {
+  // If API returns a flat list of qualities (array), split by type.
+  if (Array.isArray(data)) {
+    const video = data.filter((x) => String(x?.type || '').toLowerCase() === 'video');
+    const audio = data.filter((x) => String(x?.type || '').toLowerCase() === 'audio');
+    return { video, audio };
+  }
+
   // Try common shapes first.
   const video =
     data?.video ||
@@ -365,7 +372,10 @@ function pickQualities(data) {
     if (!node || typeof node !== 'object') return;
     if (seen.has(node)) return;
     seen.add(node);
-    if (Array.isArray(node)) return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
 
     for (const [k, v] of Object.entries(node)) {
       const key = String(k).toLowerCase();

@@ -166,15 +166,17 @@ async function handleMediaLink(ctx, url) {
           const audioQualities = opts.audio || [];
 
           const videoButtons = videoQualities.map((q) => {
-            const label = `🎬 ${labelFromQualityId(q.id)} ⬇️`;
+            const friendly = q.label && q.label !== q.id ? q.label : labelFromQualityId(q.id);
+            const label = `🎬 ${friendly} ⬇️`;
             const token = putAction({ kind: 'ytvideo', id: videoId, quality: q.id });
             return Markup.button.callback(label, `yv:${token}`);
           });
 
+          const cleanAudio = audioQualities.filter((a) => a?.id && String(a.id) !== '0');
           const preferredAudio =
-            audioQualities.find((a) => String(a.id) === '251') ||
-            audioQualities.find((a) => String(a.id) === '140') ||
-            audioQualities[0] ||
+            cleanAudio.find((a) => String(a.id) === '251') ||
+            cleanAudio.find((a) => String(a.id) === '140') ||
+            cleanAudio[0] ||
             null;
 
           const keyboardRows = [];
