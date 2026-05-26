@@ -111,6 +111,12 @@ bot.start(async (ctx) => {
   );
 });
 
+// Never crash the process on Telegram callback/query errors.
+bot.catch((err, ctx) => {
+  const updateType = ctx?.updateType || 'unknown';
+  console.error(`Telegraf error (${updateType}):`, err?.response?.description || err?.message || err);
+});
+
 bot.on('text', async (ctx) => {
   const text = (ctx.message?.text || '').trim();
   if (!text) return;
@@ -151,17 +157,23 @@ async function handleMediaLink(ctx, url) {
     if (isYouTube) {
       const yt = extractYouTubeOptions(raw);
       const videoButtons = buildYouTubeVideoButtons(yt.videos || [], videoUrl || null);
-      const audioButton = yt.audioUrl
+      const videoId = extractYouTubeId(url);
+      const audioButton = videoId
         ? Markup.button.callback(
-            "🎵 Qo‘shiqni yuklab olish",
-            `dl:a:${putAction({ kind: 'audio', url: yt.audioUrl })}`
+            "🎵 Audioni yuklab olish",
+            `ya:${putAction({ kind: 'ytaudio', id: videoId, title: title || null })}`
           )
-        : audioUrl
+        : yt.audioUrl
           ? Markup.button.callback(
-              "🎵 Qo‘shiqni yuklab olish",
-              `dl:a:${putAction({ kind: 'audio', url: audioUrl })}`
+              "🎵 Audioni yuklab olish",
+              `dl:a:${putAction({ kind: 'audio', url: yt.audioUrl })}`
             )
-          : null;
+          : audioUrl
+            ? Markup.button.callback(
+                "🎵 Audioni yuklab olish",
+                `dl:a:${putAction({ kind: 'audio', url: audioUrl })}`
+              )
+            : null;
 
       const keyboardRows = [];
       for (const row of chunk(videoButtons, 2)) keyboardRows.push(row);
@@ -242,6 +254,28 @@ function formatDurationSeconds(seconds) {
   const m = Math.floor(n / 60);
   const s = Math.floor(n % 60);
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function extractYouTubeId(inputUrl) {
+  try {
+    const u = new URL(inputUrl);
+    const host = u.hostname.toLowerCase();
+    if (host.includes('youtu.be')) {
+      const id = u.pathname.replace('/', '').trim();
+      return id || null;
+    }
+    if (host.includes('youtube.com')) {
+      const v = u.searchParams.get('v');
+      if (v) return v;
+      // Shorts: /shorts/{id}
+      const parts = u.pathname.split('/').filter(Boolean);
+      const shortsIdx = parts.indexOf('shorts');
+      if (shortsIdx >= 0 && parts[shortsIdx + 1]) return parts[shortsIdx + 1];
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 function extractYouTubeOptions(raw) {
@@ -364,7 +398,12 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
     out.push(
       Markup.button.callback(
         label,
-        `dl:v:${putAction({ kind: 'video', url: v.url, fallbackUrl: fallbackUrl || undefined })}`
+        `dl:v:${putAction({
+          kind: 'video',
+          url: v.url,
+          fallbackUrl: fallbackUrl || undefined,
+          expectedHeight: h
+        })}`
       )
     );
   }
@@ -377,7 +416,12 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
       out.push(
         Markup.button.callback(
           label,
-          `dl:v:${putAction({ kind: 'video', url: v.url, fallbackUrl: fallbackUrl || undefined })}`
+          `dl:v:${putAction({
+            kind: 'video',
+            url: v.url,
+            fallbackUrl: fallbackUrl || undefined,
+            expectedHeight: v.height || undefined
+          })}`
         )
       );
     }
@@ -472,18 +516,47 @@ bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
   const entry = getAction(token);
 
   if (!entry) {
-    await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
     return;
   }
 
-  await ctx.answerCbQuery('Bajarilyapti…');
+  try {
+    await ctx.answerCbQuery('Bajarilyapti…');
+  } catch {
+    // Callback query can expire; ignore.
+  }
+
+  let statusMsgId = null;
+  try {
+    const m = await ctx.reply(type === 'v' ? 'Video yuklanyapti…' : 'Audio yuklanyapti…');
+    statusMsgId = m?.message_id || null;
+  } catch {
+    // ignore
+  }
 
   try {
     if (type === 'v') {
-      const ok = await sendTelegramMedia(ctx, 'video', entry.url, BRAND_FOOTER, entry.fallbackUrl);
+      const ok = await withTimeout(
+        sendTelegramMedia(
+          ctx,
+          'video',
+          entry.url,
+          BRAND_FOOTER,
+          entry.fallbackUrl,
+          entry.expectedHeight
+        ),
+        120_000
+      );
       if (!ok) throw new Error('VIDEO_SEND_FAILED');
     } else {
-      const ok = await sendTelegramMedia(ctx, 'audio', entry.url, BRAND_FOOTER, entry.fallbackUrl);
+      const ok = await withTimeout(
+        sendTelegramMedia(ctx, 'audio', entry.url, BRAND_FOOTER, entry.fallbackUrl),
+        120_000
+      );
       if (!ok) throw new Error('AUDIO_SEND_FAILED');
     }
   } catch (err) {
@@ -491,6 +564,14 @@ bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
     await ctx.reply(
       "Video yuborib bo‘lmadi. Pastroq sifatni tanlang yoki havolani qaytadan yuboring."
     );
+  } finally {
+    if (statusMsgId) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, statusMsgId);
+      } catch {
+        // ignore
+      }
+    }
   }
 });
 
@@ -498,11 +579,19 @@ bot.action(/^id:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
   const entry = getAction(token);
   if (!entry) {
-    await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
     return;
   }
 
-  await ctx.answerCbQuery('Aniqlayapman…');
+  try {
+    await ctx.answerCbQuery('Aniqlayapman…');
+  } catch {
+    // ignore
+  }
 
   try {
     const { title, artist } = await recognizeSongFromAudioUrl(entry.url);
@@ -543,11 +632,19 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
   const entry = getAction(token);
   if (!entry || entry.kind !== 'recognize') {
-    await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
     return;
   }
 
-  await ctx.answerCbQuery('Qidiryapman…');
+  try {
+    await ctx.answerCbQuery('Qidiryapman…');
+  } catch {
+    // ignore
+  }
 
   try {
     const sourceUrl = entry.audioUrl || entry.videoUrl;
@@ -587,18 +684,30 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
   const index = Number(ctx.match?.[2]) - 1;
   const entry = getAction(token);
   if (!entry || entry.kind !== 'search') {
-    await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Qidiruvni qayta yuboring.");
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Qidiruvni qayta yuboring.");
+    } catch {
+      // ignore
+    }
     return;
   }
 
   const page = Number(entry.page || 0);
   const picked = entry.results?.[page * 10 + index];
   if (!picked?.id) {
-    await ctx.answerCbQuery("Noto‘g‘ri tanlov. Qaytadan urinib ko‘ring.");
+    try {
+      await ctx.answerCbQuery("Noto‘g‘ri tanlov. Qaytadan urinib ko‘ring.");
+    } catch {
+      // ignore
+    }
     return;
   }
 
-  await ctx.answerCbQuery('Yuklanyapti…');
+  try {
+    await ctx.answerCbQuery('Yuklanyapti…');
+  } catch {
+    // ignore
+  }
 
   try {
     const { mp3Url } = await downloadYouTubeMp3(picked.id);
@@ -613,18 +722,54 @@ bot.action(/^sn:([^:]+)$/, async (ctx) => {
   const token = ctx.match?.[1];
   const entry = getAction(token);
   if (!entry || entry.kind !== 'search') {
-    await ctx.answerCbQuery("Bu tugma muddati o‘tgan.");
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan.");
+    } catch {
+      // ignore
+    }
     return;
   }
 
   const page = Number(entry.page || 0) + 1;
   entry.page = page;
   actionCache.set(token, entry);
-  await ctx.answerCbQuery('Keyingi sahifa…');
+  try {
+    await ctx.answerCbQuery('Keyingi sahifa…');
+  } catch {
+    // ignore
+  }
   await sendSearchPage(ctx, token);
 });
 
-async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl) {
+bot.action(/^ya:(.+)$/, async (ctx) => {
+  const token = ctx.match?.[1];
+  const entry = getAction(token);
+  if (!entry || entry.kind !== 'ytaudio' || !entry.id) {
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  try {
+    await ctx.answerCbQuery('Yuklanyapti…');
+  } catch {
+    // ignore
+  }
+
+  try {
+    const { mp3Url } = await downloadYouTubeMp3(entry.id);
+    const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
+    await sendTelegramMedia(ctx, 'audio', mp3Url, caption);
+  } catch (err) {
+    console.error('youtube audio download error:', err?.response?.data || err?.message || err);
+    await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
+  }
+});
+
+async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight) {
   // 1) Try by URL (fast path). Telegram may fail if URL is blocked/temporary/too large.
   try {
     if (kind === 'video') {
@@ -686,10 +831,15 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl) {
       return false;
     }
     if (err?.code === 'NOT_MEDIA' || err?.message === 'NOT_MEDIA') {
-      if (fallbackUrl && fallbackUrl !== url) {
-        // Try sending the original "default" URL the provider gave (it often works).
-        return await sendTelegramMedia(ctx, kind, fallbackUrl, caption);
+      // If user picked a specific YouTube quality, don't silently fallback to default,
+      // otherwise it looks like every button downloads the same file.
+      if (kind === 'video' && expectedHeight) {
+        await ctx.reply(
+          `${expectedHeight}p format hozir ishlamayapti (to‘g‘ridan-to‘g‘ri video fayl emas). Boshqa sifatni tanlang.`
+        );
+        return false;
       }
+      if (fallbackUrl && fallbackUrl !== url) return await sendTelegramMedia(ctx, kind, fallbackUrl, caption);
       await ctx.reply("Bu format hozir ishlamayapti. Boshqa sifatni tanlang.");
       return false;
     }
@@ -704,6 +854,14 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl) {
       // ignore
     }
   }
+}
+
+function withTimeout(promise, ms) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error('TIMEOUT')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
 async function start() {

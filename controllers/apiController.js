@@ -1,4 +1,9 @@
 const axios = require('axios');
+const FormData = require('form-data');
+const os = require('os');
+const path = require('path');
+const fs = require('fs/promises');
+const { spawn } = require('child_process');
 
 function createRapidClient(baseURL, host) {
   return axios.create({
@@ -242,6 +247,18 @@ function isRateLimitOrForbidden(err) {
   return status === 429 || status === 403;
 }
 
+function isUploadFileExpectedError(err) {
+  const data = err?.response?.data;
+  const msg = JSON.stringify(data || '').toLowerCase();
+  return msg.includes('expected uploadfile') || msg.includes('uploadfile');
+}
+
+function isAudioOnlyError(err) {
+  const data = err?.response?.data;
+  const msg = JSON.stringify(data || '').toLowerCase();
+  return msg.includes('only .wav') || msg.includes('only .ogg') || msg.includes('only .mp3');
+}
+
 async function fetchAudioSampleBase64(audioUrl, maxBytes = 2_000_000) {
   // Avoid downloading the full file. Many servers support Range; if not, we still cap by truncating locally.
   const res = await axios.get(audioUrl, {
@@ -256,6 +273,60 @@ async function fetchAudioSampleBase64(audioUrl, maxBytes = 2_000_000) {
   const buf = Buffer.from(res.data);
   const sliced = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
   return sliced.toString('base64');
+}
+
+async function fetchSampleBuffer(url, maxBytes = 2_000_000) {
+  const res = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 30_000,
+    headers: { Range: `bytes=0-${maxBytes - 1}` },
+    maxContentLength: maxBytes + 1024 * 64,
+    maxBodyLength: maxBytes + 1024 * 64,
+    validateStatus: (s) => (s >= 200 && s < 300) || s === 206
+  });
+  const buf = Buffer.from(res.data);
+  const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
+  return { buf: buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf, contentType };
+}
+
+async function convertToMp3(inputBuf, inputExtHint = 'mp4') {
+  // Requires ffmpeg to be installed in the runtime (server/docker).
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'navobot-ffmpeg-'));
+  const inPath = path.join(tmpDir, `in.${inputExtHint}`);
+  const outPath = path.join(tmpDir, 'out.mp3');
+  try {
+    await fs.writeFile(inPath, inputBuf);
+    await new Promise((resolve, reject) => {
+      const p = spawn('ffmpeg', [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-t',
+        '12',
+        '-i',
+        inPath,
+        '-vn',
+        '-ac',
+        '2',
+        '-ar',
+        '44100',
+        '-codec:a',
+        'libmp3lame',
+        outPath
+      ]);
+      let stderr = '';
+      p.stderr.on('data', (d) => (stderr += d.toString()));
+      p.on('error', reject);
+      p.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg failed (${code}): ${stderr}`));
+      });
+    });
+    return await fs.readFile(outPath);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
 }
 
 async function recognizeSongFromAudioUrl(audioUrl) {
@@ -280,9 +351,36 @@ async function recognizeSongFromAudioUrl(audioUrl) {
         form.set(fileField, audioUrl);
       }
 
-      res = await shazamClient.post(detectPath, form.toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-      });
+      try {
+        res = await shazamClient.post(detectPath, form.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+      } catch (err) {
+        // Some Shazam APIs require a multipart file upload, not a URL string.
+        if (!isUploadFileExpectedError(err) && !isAudioOnlyError(err)) throw err;
+
+        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl);
+        let uploadBuf = buf;
+        let filename = 'sample.mp3';
+        let uploadType = 'audio/mpeg';
+
+        // If provider only accepts audio and we have video, transcode a short sample to mp3.
+        if (srcType.includes('video/') || isAudioOnlyError(err)) {
+          uploadBuf = await convertToMp3(buf, 'mp4');
+          filename = 'sample.mp3';
+          uploadType = 'audio/mpeg';
+        }
+
+        const fd = new FormData();
+        fd.append(fileField, uploadBuf, {
+          filename,
+          contentType: uploadType
+        });
+
+        res = await shazamClient.post(detectPath, fd, {
+          headers: fd.getHeaders()
+        });
+      }
     } else {
       const audioField = process.env.SHAZAM_AUDIO_FIELD || 'audio';
       const audioBase64 = await fetchAudioSampleBase64(audioUrl);
