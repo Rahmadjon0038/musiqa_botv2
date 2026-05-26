@@ -347,6 +347,8 @@ function extractYouTubeOptions(raw) {
   }
 
   visit(formats);
+  // Some providers don't expose formats cleanly; keep a wider scan as fallback.
+  visit(raw);
 
   const videos = [];
   // Prefer likely-direct media URLs first.
@@ -441,6 +443,16 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
         )
       );
     }
+  }
+
+  // If still empty, at least offer a single download button using the provider's default URL.
+  if (!out.length && fallbackUrl) {
+    out.push(
+      Markup.button.callback(
+        '🎬 Video ⬇️',
+        `dl:v:${putAction({ kind: 'video', url: fallbackUrl })}`
+      )
+    );
   }
 
   return out;
