@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-navobot}
+      POSTGRES_USER: ${POSTGRES_USER:-navobot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-navobot}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      BOT_TOKEN: ${BOT_TOKEN}
+      RAPIDAPI_KEY: ${RAPIDAPI_KEY}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-navobot}:${POSTGRES_PASSWORD:-navobot}@db:5432/${POSTGRES_DB:-navobot}}
+      MEDIA_API_BASEURL: ${MEDIA_API_BASEURL}
+      MEDIA_API_HOST: ${MEDIA_API_HOST}
+      MEDIA_API_PATH: ${MEDIA_API_PATH}
+      MEDIA_API_METHOD: ${MEDIA_API_METHOD}
+      YT_API_BASEURL: ${YT_API_BASEURL}
+      YT_API_HOST: ${YT_API_HOST}
+      YT_API_SEARCH_PATH: ${YT_API_SEARCH_PATH}
+      YT_API_SEARCH_PARAM: ${YT_API_SEARCH_PARAM}
+      YT_API_DL_PATH: ${YT_API_DL_PATH}
+      YT_API_DL_PARAM: ${YT_API_DL_PARAM}
+      YT_API_DL_QUALITY: ${YT_API_DL_QUALITY}
+      YT_DL_BASEURL: ${YT_DL_BASEURL}
+      YT_DL_HOST: ${YT_DL_HOST}
+      SHAZAM_API_BASEURL: ${SHAZAM_API_BASEURL}
+      SHAZAM_API_HOST: ${SHAZAM_API_HOST}
+      SHAZAM_DETECT_PATH: ${SHAZAM_DETECT_PATH}
+      SHAZAM_CONTENT_TYPE: ${SHAZAM_CONTENT_TYPE}
+      SHAZAM_FILE_FIELD: ${SHAZAM_FILE_FIELD}
+      SHAZAM_FILE_MODE: ${SHAZAM_FILE_MODE}
+      MAX_TELEGRAM_UPLOAD_BYTES: ${MAX_TELEGRAM_UPLOAD_BYTES}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+
