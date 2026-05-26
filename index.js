@@ -906,10 +906,17 @@ bot.action(/^yv:(.+)$/, async (ctx) => {
 
   try {
     console.log('YT video download start:', { id: entry.id, quality: entry.quality });
-    const { url } = await downloadYouTubeVideoByQuality(entry.id, entry.quality);
-    console.log('YT video download:', { id: entry.id, quality: entry.quality, url });
+    const { url, reservedUrl, raw } = await downloadYouTubeVideoByQuality(entry.id, entry.quality);
+    console.log('YT video download:', { id: entry.id, quality: entry.quality, url, reservedUrl });
+
+    const chosen = await waitUntilReady([url, reservedUrl].filter(Boolean), 180_000);
+    if (!chosen) {
+      await ctx.reply("Video tayyor bo‘lmadi. 1-2 daqiqadan keyin yana urinib ko‘ring.");
+      return;
+    }
+
     const qLabel = labelFromQualityId(entry.quality);
-    await sendTelegramMedia(ctx, 'video', url, `${qLabel}\n${BRAND_FOOTER}`, undefined, qLabel);
+    await sendTelegramMedia(ctx, 'video', chosen, `${qLabel}\n${BRAND_FOOTER}`, undefined, qLabel);
   } catch (err) {
     console.error(
       'youtube video download error:',
@@ -939,9 +946,14 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
 
   try {
     console.log('YT audio download start:', { id: entry.id, quality: entry.quality });
-    const { url } = await downloadYouTubeAudioByQuality(entry.id, entry.quality);
+    const { url, reservedUrl } = await downloadYouTubeAudioByQuality(entry.id, entry.quality);
+    const chosen = await waitUntilReady([url, reservedUrl].filter(Boolean), 180_000);
+    if (!chosen) {
+      await ctx.reply("Audio tayyor bo‘lmadi. 1-2 daqiqadan keyin yana urinib ko‘ring.");
+      return;
+    }
     const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
-    await sendTelegramMedia(ctx, 'audio', url, caption);
+    await sendTelegramMedia(ctx, 'audio', chosen, caption);
   } catch (err) {
     console.error(
       'youtube audio (quality) error:',
@@ -950,6 +962,33 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
     await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
   }
 });
+
+async function waitUntilReady(urls, maxWaitMs) {
+  const deadline = Date.now() + maxWaitMs;
+  const tried = new Set();
+  while (Date.now() < deadline) {
+    for (const url of urls) {
+      if (!url || tried.has(`${url}:ok`)) continue;
+      try {
+        const res = await axios.get(url, {
+          timeout: 20_000,
+          responseType: 'arraybuffer',
+          headers: { Range: 'bytes=0-0', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.youtube.com/' },
+          validateStatus: () => true
+        });
+        if (res.status === 200 || res.status === 206) {
+          tried.add(`${url}:ok`);
+          return url;
+        }
+        // 404 is expected while provider is preparing the file.
+      } catch {
+        // ignore and retry
+      }
+    }
+    await new Promise((r) => setTimeout(r, 5_000));
+  }
+  return null;
+}
 
 async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight) {
   // 1) Try by URL (fast path). Telegram may fail if URL is blocked/temporary/too large.

@@ -56,10 +56,32 @@ function pickFirstUrl(value) {
     }
   }
   if (typeof value === 'object') {
-    for (const k of ['url', 'link', 'download', 'downloadUrl', 'download_url', 'src']) {
+    for (const k of [
+      'url',
+      'link',
+      'download',
+      'downloadUrl',
+      'download_url',
+      'src',
+      'file',
+      'reserved_file',
+      'reservedFile',
+      'direct',
+      'direct_url',
+      'directUrl'
+    ]) {
       const found = pickFirstUrl(value[k]);
       if (found) return found;
     }
+  }
+  return null;
+}
+
+function pickUrlByKeys(obj, keys) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === 'string' && /^https?:\/\//i.test(v)) return v;
   }
   return null;
 }
@@ -457,12 +479,16 @@ async function downloadYouTubeVideoByQuality(videoId, quality) {
     pickFirstUrl(res.data?.data) ||
     pickFirstUrl(res.data?.result) ||
     pickFirstUrl(res.data);
+  const reservedUrl =
+    pickUrlByKeys(res.data, ['reserved_file', 'reservedFile']) ||
+    pickUrlByKeys(res.data?.result, ['reserved_file', 'reservedFile']) ||
+    null;
   if (!url) {
     const err = new Error('Video download API returned no URL');
     err.details = res.data;
     throw err;
   }
-  return { url, raw: res.data };
+  return { url, reservedUrl, raw: res.data };
 }
 
 async function downloadYouTubeAudioByQuality(videoId, quality) {
@@ -477,12 +503,16 @@ async function downloadYouTubeAudioByQuality(videoId, quality) {
     pickFirstUrl(res.data?.data) ||
     pickFirstUrl(res.data?.result) ||
     pickFirstUrl(res.data);
+  const reservedUrl =
+    pickUrlByKeys(res.data, ['reserved_file', 'reservedFile']) ||
+    pickUrlByKeys(res.data?.result, ['reserved_file', 'reservedFile']) ||
+    null;
   if (!url) {
     const err = new Error('Audio download API returned no URL');
     err.details = res.data;
     throw err;
   }
-  return { url, raw: res.data };
+  return { url, reservedUrl, raw: res.data };
 }
 
 async function recognizeSongFromAudioUrl(audioUrl) {
