@@ -133,15 +133,19 @@ async function handleMediaLink(ctx, url) {
     const isYouTube = host.includes('youtube.com') || host.includes('youtu.be');
 
     const buttons = [];
-    if (audioUrl) {
-      // Instagram/TikTok uchun tugma: videodagi qo‘shiqni aniqlab, variantlarni taklif qiladi.
-      const token = putAction({ kind: 'recognize', url: audioUrl });
-      buttons.push(
-        Markup.button.callback(
-          isShort ? "🎵 Qo‘shiqni yuklab olish" : '🎵 Audio ⬇️',
-          isShort ? `rs:${token}` : `dl:a:${token}`
-        )
-      );
+
+    // Instagram/TikTok uchun tugma doim chiqsin: qo‘shiqni aniqlab, variantlarni taklif qiladi.
+    // Ba'zi downloaderlar audioUrl bermaydi; shunda videoUrl orqali ham sinab ko‘ramiz.
+    if (isShort && (audioUrl || videoUrl)) {
+      const token = putAction({
+        kind: 'recognize',
+        audioUrl: audioUrl || null,
+        videoUrl: videoUrl || null
+      });
+      buttons.push(Markup.button.callback("🎵 Qo‘shiqni yuklab olish", `rs:${token}`));
+    } else if (audioUrl) {
+      const token = putAction({ kind: 'audio', url: audioUrl });
+      buttons.push(Markup.button.callback('🎵 Audio ⬇️', `dl:a:${token}`));
     }
 
     if (isYouTube) {
@@ -546,7 +550,13 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('Qidiryapman…');
 
   try {
-    const { title, artist } = await recognizeSongFromAudioUrl(entry.url);
+    const sourceUrl = entry.audioUrl || entry.videoUrl;
+    if (!sourceUrl) {
+      await ctx.reply("Audio topilmadi. Iltimos, havolani qaytadan yuboring.");
+      return;
+    }
+
+    const { title, artist } = await recognizeSongFromAudioUrl(sourceUrl);
     const query = [artist, title].filter(Boolean).join(' - ') || title;
 
     const { results, total } = await searchYouTube(query);
