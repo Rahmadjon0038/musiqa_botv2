@@ -905,12 +905,16 @@ bot.action(/^yv:(.+)$/, async (ctx) => {
   }
 
   try {
+    console.log('YT video download start:', { id: entry.id, quality: entry.quality });
     const { url } = await downloadYouTubeVideoByQuality(entry.id, entry.quality);
     console.log('YT video download:', { id: entry.id, quality: entry.quality, url });
     const qLabel = labelFromQualityId(entry.quality);
     await sendTelegramMedia(ctx, 'video', url, `${qLabel}\n${BRAND_FOOTER}`, undefined, qLabel);
   } catch (err) {
-    console.error('youtube video download error:', err?.response?.data || err?.message || err);
+    console.error(
+      'youtube video download error:',
+      err?.response?.data || err?.details || err?.message || err
+    );
     await ctx.reply("Video yuklab bo‘lmadi. Boshqa sifatni tanlang.");
   }
 });
@@ -934,11 +938,15 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
   }
 
   try {
+    console.log('YT audio download start:', { id: entry.id, quality: entry.quality });
     const { url } = await downloadYouTubeAudioByQuality(entry.id, entry.quality);
     const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
     await sendTelegramMedia(ctx, 'audio', url, caption);
   } catch (err) {
-    console.error('youtube audio (quality) error:', err?.response?.data || err?.message || err);
+    console.error(
+      'youtube audio (quality) error:',
+      err?.response?.data || err?.details || err?.message || err
+    );
     await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
   }
 });

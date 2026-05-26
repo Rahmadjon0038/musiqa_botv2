@@ -5,10 +5,10 @@ const path = require('path');
 const fs = require('fs/promises');
 const { spawn } = require('child_process');
 
-function createRapidClient(baseURL, host) {
+function createRapidClient(baseURL, host, timeoutMs = 30_000) {
   return axios.create({
     baseURL,
-    timeout: 30_000,
+    timeout: timeoutMs,
     headers: {
       'X-RapidAPI-Key': process.env.RAPIDAPI_KEY || '',
       ...(host ? { 'X-RapidAPI-Host': host } : {})
@@ -39,7 +39,11 @@ const ytDlClient = createRapidClient(
   process.env.YT_DL_BASEURL || process.env.YT_API_BASEURL,
   process.env.YT_DL_HOST || process.env.YT_API_HOST
 );
-const ytVideoClient = createRapidClient(process.env.YT_VIDEO_API_BASEURL, process.env.YT_VIDEO_API_HOST);
+const ytVideoClient = createRapidClient(
+  process.env.YT_VIDEO_API_BASEURL,
+  process.env.YT_VIDEO_API_HOST,
+  Number(process.env.YT_VIDEO_TIMEOUT_MS || 60_000)
+);
 const shazamClient = createRapidClient(process.env.SHAZAM_API_BASEURL, process.env.SHAZAM_API_HOST);
 
 function pickFirstUrl(value) {
@@ -447,8 +451,17 @@ async function downloadYouTubeVideoByQuality(videoId, quality) {
   const tpl = process.env.YT_VIDEO_DOWNLOAD_PATH || '/download_video/{id}';
   const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
   const res = await ytVideoClient.get(pathUrl, { params: { quality, response_mode: 'default' } });
-  const url = pickFirstUrl(res.data?.url) || pickFirstUrl(res.data?.link) || pickFirstUrl(res.data?.data) || pickFirstUrl(res.data);
-  if (!url) throw new Error('Video download API returned no URL');
+  const url =
+    pickFirstUrl(res.data?.url) ||
+    pickFirstUrl(res.data?.link) ||
+    pickFirstUrl(res.data?.data) ||
+    pickFirstUrl(res.data?.result) ||
+    pickFirstUrl(res.data);
+  if (!url) {
+    const err = new Error('Video download API returned no URL');
+    err.details = res.data;
+    throw err;
+  }
   return { url, raw: res.data };
 }
 
@@ -458,8 +471,17 @@ async function downloadYouTubeAudioByQuality(videoId, quality) {
   const tpl = process.env.YT_VIDEO_AUDIO_PATH || '/download_audio/{id}';
   const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
   const res = await ytVideoClient.get(pathUrl, { params: { quality, response_mode: 'default' } });
-  const url = pickFirstUrl(res.data?.url) || pickFirstUrl(res.data?.link) || pickFirstUrl(res.data?.data) || pickFirstUrl(res.data);
-  if (!url) throw new Error('Audio download API returned no URL');
+  const url =
+    pickFirstUrl(res.data?.url) ||
+    pickFirstUrl(res.data?.link) ||
+    pickFirstUrl(res.data?.data) ||
+    pickFirstUrl(res.data?.result) ||
+    pickFirstUrl(res.data);
+  if (!url) {
+    const err = new Error('Audio download API returned no URL');
+    err.details = res.data;
+    throw err;
+  }
   return { url, raw: res.data };
 }
 
