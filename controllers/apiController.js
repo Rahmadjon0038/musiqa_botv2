@@ -355,8 +355,12 @@ async function fetchSampleBuffer(url, maxBytes = 2_000_000) {
   return { buf: buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf, contentType };
 }
 
-async function convertToMp3(inputBuf, inputExtHint = 'mp4') {
+async function convertToMp3(inputBuf, inputExtHint = 'mp4', opts = {}) {
   // Requires ffmpeg to be installed in the runtime (server/docker).
+  const seconds = Number(opts.seconds ?? 4);
+  const bitrate = String(opts.bitrate ?? '96k');
+  const sampleRate = Number(opts.sampleRate ?? 16000);
+  const channels = Number(opts.channels ?? 1);
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'navobot-ffmpeg-'));
   const inPath = path.join(tmpDir, `in.${inputExtHint}`);
   const outPath = path.join(tmpDir, 'out.mp3');
@@ -369,16 +373,18 @@ async function convertToMp3(inputBuf, inputExtHint = 'mp4') {
         'error',
         '-y',
         '-t',
-        '12',
+        String(seconds),
         '-i',
         inPath,
         '-vn',
         '-ac',
-        '2',
+        String(channels),
         '-ar',
-        '44100',
+        String(sampleRate),
         '-codec:a',
         'libmp3lame',
+        '-b:a',
+        bitrate,
         outPath
       ]);
       let stderr = '';
@@ -563,7 +569,23 @@ async function recognizeSongFromAudioUrl(audioUrl) {
     const contentType = process.env.SHAZAM_CONTENT_TYPE || 'application/json';
 
     let res;
-    if (contentType.includes('application/x-www-form-urlencoded')) {
+    if (contentType.includes('multipart/form-data')) {
+      const fileField = process.env.SHAZAM_FILE_FIELD || 'file';
+      const sampleBytes = Number(process.env.SHAZAM_SAMPLE_BYTES || 2_000_000);
+
+      const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl, sampleBytes);
+      let uploadBuf = buf;
+      if (srcType.includes('video/')) {
+        uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
+      } else if (srcType.includes('audio/') && !srcType.includes('mpeg')) {
+        // Normalize odd audio formats to mp3 to match API requirements.
+        uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
+      }
+
+      const fd = new FormData();
+      fd.append(fileField, uploadBuf, { filename: 'sample.mp3', contentType: 'audio/mpeg' });
+      res = await shazamClient.post(detectPath, fd, { headers: fd.getHeaders() });
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
       const fileField = process.env.SHAZAM_FILE_FIELD || 'file';
       const mode = (process.env.SHAZAM_FILE_MODE || 'url').toLowerCase();
       const sampleBytes = Number(process.env.SHAZAM_SAMPLE_BYTES || 8_000_000);
@@ -575,7 +597,7 @@ async function recognizeSongFromAudioUrl(audioUrl) {
         let filename = 'sample.mp3';
         let uploadType = 'audio/mpeg';
         if (srcType.includes('video/')) {
-          uploadBuf = await convertToMp3(buf, 'mp4');
+          uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
         }
 
         // Some providers accept base64 in form field, some require multipart.
@@ -628,7 +650,7 @@ async function recognizeSongFromAudioUrl(audioUrl) {
 
         // If provider only accepts audio and we have video, transcode a short sample to mp3.
         if (srcType.includes('video/') || isAudioOnlyError(err)) {
-          uploadBuf = await convertToMp3(buf, 'mp4');
+          uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
           filename = 'sample.mp3';
           uploadType = 'audio/mpeg';
         }
