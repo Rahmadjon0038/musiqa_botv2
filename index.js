@@ -313,6 +313,76 @@ async function handleAdminDeleteLastBroadcast(ctx) {
   }
 }
 
+async function handleAdminBroadcastMessage(ctx) {
+  const st = adminState.get(ctx.from?.id);
+  if (ctx.chat?.type !== 'private' || !isAdmin(ctx) || st?.mode !== 'broadcast') return false;
+
+  adminState.delete(ctx.from.id);
+  const status = await startLoader(ctx, 'Reklama yuborilyapti…');
+  try {
+    const adFooter = process.env.AD_FOOTER || BRAND_FOOTER;
+    const hasTextOnly = Boolean(ctx.message?.text);
+    const rawText = (ctx.message?.text || '').trim();
+    const broadcastText = hasTextOnly ? `${rawText}\n\n${adFooter}` : rawText;
+
+    const created = await pool.query(
+      'INSERT INTO broadcasts (created_by, text) VALUES ($1, $2) RETURNING id',
+      [ctx.from.id, hasTextOnly ? broadcastText : '[media]']
+    );
+    const broadcastId = created.rows?.[0]?.id;
+
+    const res = await pool.query('SELECT telegram_id FROM users');
+    const ids = res.rows.map((r) => Number(r.telegram_id)).filter(Boolean);
+    if (!ids.length) {
+      await status.stop(null, true);
+      await ctx.reply("Hali foydalanuvchilar yo‘q (users jadvali bo‘sh). Avval foydalanuvchilar botga /start bosishi kerak.");
+      return true;
+    }
+
+    let ok = 0;
+    let fail = 0;
+    for (const id of ids) {
+      try {
+        if (hasTextOnly) {
+          const sent = await ctx.telegram.sendMessage(id, broadcastText);
+          if (broadcastId && sent?.message_id) {
+            await pool.query(
+              'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+              [broadcastId, id, sent.message_id]
+            );
+          }
+        } else {
+          const copied = await ctx.telegram.copyMessage(id, ctx.chat.id, ctx.message.message_id);
+          if (broadcastId && copied?.message_id) {
+            await pool.query(
+              'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+              [broadcastId, id, copied.message_id]
+            );
+          }
+          const footerMsg = await ctx.telegram.sendMessage(id, adFooter);
+          if (broadcastId && footerMsg?.message_id) {
+            await pool.query(
+              'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+              [broadcastId, id, footerMsg.message_id]
+            );
+          }
+        }
+        ok++;
+      } catch {
+        fail++;
+      }
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    await status.stop(null, true);
+    await ctx.reply(`✅ Yuborildi: ${ok}\n❌ Xato: ${fail}`);
+  } catch (e) {
+    await status.stop(null, true);
+    console.error('broadcast failed:', e?.message || e);
+    await ctx.reply('Reklama yuborishda xatolik bo‘ldi.');
+  }
+  return true;
+}
+
 bot.start(async (ctx) => {
   try {
     const telegramId = ctx.from?.id;
@@ -437,6 +507,14 @@ bot.action('adm:del_last', async (ctx) => {
 });
 
 bot.use(async (ctx, next) => {
+  // Admin broadcast mode should accept any message type (text/photo/video/etc) in private chat.
+  try {
+    const handled = await handleAdminBroadcastMessage(ctx);
+    if (handled) return;
+  } catch (e) {
+    console.error('broadcast middleware failed:', e?.message || e);
+  }
+
   const msg = ctx.message;
   const forwarded = msg?.forward_from_chat;
   if (forwarded?.type === 'channel' && forwarded?.id) {
@@ -472,76 +550,6 @@ bot.on('text', async (ctx) => {
     }
     if (text === '🗑 Oxirgi reklama') {
       await handleAdminDeleteLastBroadcast(ctx);
-      return;
-    }
-  }
-
-  // Admin broadcast mode (private chats only).
-  if (ctx.chat?.type === 'private' && isAdmin(ctx)) {
-    const st = adminState.get(ctx.from.id);
-    if (st?.mode === 'broadcast') {
-      adminState.delete(ctx.from.id);
-      const status = await startLoader(ctx, 'Reklama yuborilyapti…');
-      try {
-        const adFooter = process.env.AD_FOOTER || BRAND_FOOTER;
-        const hasTextOnly = Boolean(ctx.message?.text);
-        const broadcastText = hasTextOnly ? `${text}\n\n${adFooter}` : text;
-
-        const created = await pool.query(
-          'INSERT INTO broadcasts (created_by, text) VALUES ($1, $2) RETURNING id',
-          [ctx.from.id, broadcastText]
-        );
-        const broadcastId = created.rows?.[0]?.id;
-
-        const res = await pool.query('SELECT telegram_id FROM users');
-        const ids = res.rows.map((r) => Number(r.telegram_id)).filter(Boolean);
-        if (!ids.length) {
-          await status.stop(null, true);
-          await ctx.reply("Hali foydalanuvchilar yo‘q (users jadvali bo‘sh). Avval foydalanuvchilar botga /start bosishi kerak.");
-          return;
-        }
-        let ok = 0;
-        let fail = 0;
-        for (const id of ids) {
-          try {
-            if (hasTextOnly) {
-              const sent = await ctx.telegram.sendMessage(id, broadcastText);
-              if (broadcastId && sent?.message_id) {
-                await pool.query(
-                  'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-                  [broadcastId, id, sent.message_id]
-                );
-              }
-            } else {
-              // Copy the admin's message (photo/video/etc) and then send a footer text.
-              const copied = await ctx.telegram.copyMessage(id, ctx.chat.id, ctx.message.message_id);
-              if (broadcastId && copied?.message_id) {
-                await pool.query(
-                  'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-                  [broadcastId, id, copied.message_id]
-                );
-              }
-              const footerMsg = await ctx.telegram.sendMessage(id, adFooter);
-              if (broadcastId && footerMsg?.message_id) {
-                await pool.query(
-                  'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-                  [broadcastId, id, footerMsg.message_id]
-                );
-              }
-            }
-            ok++;
-          } catch {
-            fail++;
-          }
-          await new Promise((r) => setTimeout(r, 60));
-        }
-        await status.stop(null, true);
-        await ctx.reply(`✅ Yuborildi: ${ok}\n❌ Xato: ${fail}`);
-      } catch (e) {
-        await status.stop(null, true);
-        console.error('broadcast failed:', e?.message || e);
-        await ctx.reply('Reklama yuborishda xatolik bo‘ldi.');
-      }
       return;
     }
   }
