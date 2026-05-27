@@ -221,7 +221,8 @@ async function adminPanel(ctx) {
     Markup.inlineKeyboard(
       [
         [Markup.button.callback('📊 Statistika', 'adm:stats')],
-        [Markup.button.callback('📣 Reklama yuborish', 'adm:bcast')]
+        [Markup.button.callback('📣 Reklama yuborish', 'adm:bcast')],
+        [Markup.button.callback('🗑 Oxirgi reklama (o‘chirish)', 'adm:del_last')]
       ],
       { columns: 1 }
     )
@@ -229,9 +230,83 @@ async function adminPanel(ctx) {
 }
 
 function adminStaticKeyboard() {
-  return Markup.keyboard([['📊 Statistika', '📣 Reklama'], ['❌ Admin menyuni yopish']])
+  return Markup.keyboard([['📊 Statistika', '📣 Reklama'], ['🗑 Oxirgi reklama']])
     .resize()
     .oneTime(false);
+}
+
+async function handleAdminStats(ctx) {
+  try {
+    const users = await pool.query('SELECT COUNT(*)::bigint AS n FROM users');
+    const mediaCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM media_cache');
+    const searchCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM search_cache');
+    const broadcasts = await pool.query('SELECT COUNT(*)::bigint AS n FROM broadcasts');
+    const text = [
+      '📊 Statistika',
+      '',
+      `👤 Foydalanuvchilar: ${users.rows?.[0]?.n || 0}`,
+      `📦 Media cache: ${mediaCache.rows?.[0]?.n || 0}`,
+      `🔎 Search cache: ${searchCache.rows?.[0]?.n || 0}`,
+      `📣 Reklamalar: ${broadcasts.rows?.[0]?.n || 0}`
+    ].join('\n');
+    await ctx.reply(text);
+  } catch (e) {
+    console.error('admin stats failed:', e?.message || e);
+    await ctx.reply('Statistika olishda xatolik bo‘ldi.');
+  }
+}
+
+async function handleAdminBroadcastStart(ctx) {
+  adminState.set(ctx.from.id, { mode: 'broadcast' });
+  await ctx.reply('Reklama matnini yuboring (keyingi xabaringiz hamma foydalanuvchilarga ketadi).');
+}
+
+async function handleAdminDeleteLastBroadcast(ctx) {
+  const status = await startLoader(ctx, 'Oxirgi reklamani o‘chiryapman…');
+  try {
+    const last = await pool.query(
+      `SELECT id, text FROM broadcasts
+       WHERE deleted_at IS NULL
+       ORDER BY id DESC
+       LIMIT 1`
+    );
+    const row = last.rows?.[0];
+    if (!row?.id) {
+      await status.stop(null, true);
+      await ctx.reply('O‘chirish uchun reklama topilmadi.');
+      return;
+    }
+
+    const msgs = await pool.query(
+      `SELECT telegram_id, message_id
+       FROM broadcast_messages
+       WHERE broadcast_id = $1`,
+      [row.id]
+    );
+
+    let ok = 0;
+    let fail = 0;
+    for (const r of msgs.rows) {
+      const chatId = Number(r.telegram_id);
+      const messageId = Number(r.message_id);
+      if (!chatId || !messageId) continue;
+      try {
+        await ctx.telegram.deleteMessage(chatId, messageId);
+        ok++;
+      } catch {
+        fail++;
+      }
+      await new Promise((res) => setTimeout(res, 40));
+    }
+
+    await pool.query('UPDATE broadcasts SET deleted_at = NOW() WHERE id = $1', [row.id]);
+    await status.stop(null, true);
+    await ctx.reply(`🗑 O‘chirildi: ${ok}\n❌ O‘chmadi: ${fail}`);
+  } catch (e) {
+    await status.stop(null, true);
+    console.error('delete last broadcast failed:', e?.message || e);
+    await ctx.reply('Reklamani o‘chirishda xatolik bo‘ldi.');
+  }
 }
 
 bot.start(async (ctx) => {
@@ -338,23 +413,7 @@ bot.action('adm:stats', async (ctx) => {
   try {
     await ctx.answerCbQuery('Yig‘ilyapti…');
   } catch {}
-
-  try {
-    const users = await pool.query('SELECT COUNT(*)::bigint AS n FROM users');
-    const mediaCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM media_cache');
-    const searchCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM search_cache');
-    const text = [
-      '📊 Statistika',
-      '',
-      `👤 Foydalanuvchilar: ${users.rows?.[0]?.n || 0}`,
-      `📦 Media cache: ${mediaCache.rows?.[0]?.n || 0}`,
-      `🔎 Search cache: ${searchCache.rows?.[0]?.n || 0}`
-    ].join('\n');
-    await ctx.reply(text);
-  } catch (e) {
-    console.error('admin stats failed:', e?.message || e);
-    await ctx.reply('Statistika olishda xatolik bo‘ldi.');
-  }
+  await handleAdminStats(ctx);
 });
 
 bot.action('adm:bcast', async (ctx) => {
@@ -362,8 +421,15 @@ bot.action('adm:bcast', async (ctx) => {
   try {
     await ctx.answerCbQuery('OK');
   } catch {}
-  adminState.set(ctx.from.id, { mode: 'broadcast' });
-  await ctx.reply('Reklama matnini yuboring (keyingi xabaringiz hamma foydalanuvchilarga ketadi).');
+  await handleAdminBroadcastStart(ctx);
+});
+
+bot.action('adm:del_last', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    await ctx.answerCbQuery('OK');
+  } catch {}
+  await handleAdminDeleteLastBroadcast(ctx);
 });
 
 bot.use(async (ctx, next) => {
@@ -393,32 +459,15 @@ bot.on('text', async (ctx) => {
   // Admin static menu (private only)
   if (ctx.chat?.type === 'private' && isAdmin(ctx)) {
     if (text === '📊 Statistika') {
-      // Reuse the same handler as inline buttons
-      await bot.handleUpdate({
-        callback_query: {
-          id: String(Date.now()),
-          from: ctx.from,
-          message: ctx.message,
-          chat_instance: '0',
-          data: 'adm:stats'
-        }
-      });
+      await handleAdminStats(ctx);
       return;
     }
     if (text === '📣 Reklama') {
-      await bot.handleUpdate({
-        callback_query: {
-          id: String(Date.now()),
-          from: ctx.from,
-          message: ctx.message,
-          chat_instance: '0',
-          data: 'adm:bcast'
-        }
-      });
+      await handleAdminBroadcastStart(ctx);
       return;
     }
-    if (text === '❌ Admin menyuni yopish') {
-      await ctx.reply('Admin menyu yopildi.', Markup.removeKeyboard());
+    if (text === '🗑 Oxirgi reklama') {
+      await handleAdminDeleteLastBroadcast(ctx);
       return;
     }
   }
@@ -430,13 +479,25 @@ bot.on('text', async (ctx) => {
       adminState.delete(ctx.from.id);
       const status = await startLoader(ctx, 'Reklama yuborilyapti…');
       try {
+        const created = await pool.query(
+          'INSERT INTO broadcasts (created_by, text) VALUES ($1, $2) RETURNING id',
+          [ctx.from.id, text]
+        );
+        const broadcastId = created.rows?.[0]?.id;
+
         const res = await pool.query('SELECT telegram_id FROM users');
         const ids = res.rows.map((r) => Number(r.telegram_id)).filter(Boolean);
         let ok = 0;
         let fail = 0;
         for (const id of ids) {
           try {
-            await ctx.telegram.sendMessage(id, text);
+            const sent = await ctx.telegram.sendMessage(id, text);
+            if (broadcastId && sent?.message_id) {
+              await pool.query(
+                'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+                [broadcastId, id, sent.message_id]
+              );
+            }
             ok++;
           } catch {
             fail++;
@@ -552,6 +613,9 @@ async function handleMediaLink(ctx, url) {
             const at = putAction({ kind: 'ytaudio2', id: videoId, quality: preferredAudio.id, title: title || null });
             keyboardRows.push([Markup.button.callback("🎵 Audioni yuklab olish", `ya2:${at}`)]);
           }
+          // Download MP3 from the same YouTube videoId (fast path).
+          const mt = putAction({ kind: 'ytmp3', id: videoId, title: title || null });
+          keyboardRows.push([Markup.button.callback("🎵 Musiqani yuklab olish (MP3)", `ym:${mt}`)]);
 
           if (!keyboardRows.length) {
             await ctx.reply("Bu videoda formatlar topilmadi. Boshqa YouTube link yuboring yoki keyinroq urinib ko‘ring.");
@@ -1412,6 +1476,37 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
       err?.response?.data || err?.details || err?.message || err
     );
     await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
+  }
+});
+
+bot.action(/^ym:(.+)$/, async (ctx) => {
+  const token = ctx.match?.[1];
+  const entry = getAction(token);
+  if (!entry || entry.kind !== 'ytmp3' || !entry.id) {
+    try {
+      await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  try {
+    await ctx.answerCbQuery('Yuklanyapti…');
+  } catch {
+    // ignore
+  }
+
+  const loader = await startLoader(ctx, 'MP3 tayyorlanyapti…');
+  try {
+    const { mp3Url } = await downloadYouTubeMp3(entry.id);
+    await loader.stop(null, true);
+    const caption = [entry.title || 'YouTube MP3', '', BRAND_FOOTER].join('\n');
+    await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id));
+  } catch (err) {
+    await loader.stop(null, true);
+    console.error('youtube mp3 by id error:', err?.response?.data || err?.message || err);
+    await ctx.reply("MP3 yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
   }
 });
 

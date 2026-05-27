@@ -69,6 +69,26 @@ async function initDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS broadcasts (
+      id BIGSERIAL PRIMARY KEY,
+      created_by BIGINT,
+      text TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      deleted_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS broadcast_messages (
+      broadcast_id BIGINT NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE,
+      telegram_id BIGINT NOT NULL,
+      message_id BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (broadcast_id, telegram_id, message_id)
+    );
+  `);
 }
 
 async function getMediaCache(cacheKey) {
