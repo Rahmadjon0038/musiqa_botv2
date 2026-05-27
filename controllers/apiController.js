@@ -77,6 +77,35 @@ function pickFirstUrl(value) {
   return null;
 }
 
+function pickFirstUrlSkippingReserved(value) {
+  if (!value) return null;
+  if (typeof value === 'string' && /^https?:\/\//i.test(value)) return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = pickFirstUrlSkippingReserved(item);
+      if (found) return found;
+    }
+  }
+  if (typeof value === 'object') {
+    for (const k of [
+      'url',
+      'link',
+      'download',
+      'downloadUrl',
+      'download_url',
+      'src',
+      'file',
+      'direct',
+      'direct_url',
+      'directUrl'
+    ]) {
+      const found = pickFirstUrlSkippingReserved(value[k]);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function pickUrlByKeys(obj, keys) {
   if (!obj || typeof obj !== 'object') return null;
   for (const k of keys) {
@@ -474,11 +503,11 @@ async function downloadYouTubeVideoByQuality(videoId, quality) {
   const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
   const res = await ytVideoClient.get(pathUrl, { params: { quality, response_mode: 'default' } });
   const url =
-    pickFirstUrl(res.data?.url) ||
-    pickFirstUrl(res.data?.link) ||
-    pickFirstUrl(res.data?.data) ||
-    pickFirstUrl(res.data?.result) ||
-    pickFirstUrl(res.data);
+    pickFirstUrlSkippingReserved(res.data?.url) ||
+    pickFirstUrlSkippingReserved(res.data?.link) ||
+    pickFirstUrlSkippingReserved(res.data?.data) ||
+    pickFirstUrlSkippingReserved(res.data?.result) ||
+    pickFirstUrlSkippingReserved(res.data);
   const reservedUrl =
     pickUrlByKeys(res.data, ['reserved_file', 'reservedFile']) ||
     pickUrlByKeys(res.data?.result, ['reserved_file', 'reservedFile']) ||
@@ -498,11 +527,11 @@ async function downloadYouTubeAudioByQuality(videoId, quality) {
   const pathUrl = tpl.includes('{id}') ? tpl.replace('{id}', encodeURIComponent(videoId)) : `${tpl}/${encodeURIComponent(videoId)}`;
   const res = await ytVideoClient.get(pathUrl, { params: { quality, response_mode: 'default' } });
   const url =
-    pickFirstUrl(res.data?.url) ||
-    pickFirstUrl(res.data?.link) ||
-    pickFirstUrl(res.data?.data) ||
-    pickFirstUrl(res.data?.result) ||
-    pickFirstUrl(res.data);
+    pickFirstUrlSkippingReserved(res.data?.url) ||
+    pickFirstUrlSkippingReserved(res.data?.link) ||
+    pickFirstUrlSkippingReserved(res.data?.data) ||
+    pickFirstUrlSkippingReserved(res.data?.result) ||
+    pickFirstUrlSkippingReserved(res.data);
   const reservedUrl =
     pickUrlByKeys(res.data, ['reserved_file', 'reservedFile']) ||
     pickUrlByKeys(res.data?.result, ['reserved_file', 'reservedFile']) ||
