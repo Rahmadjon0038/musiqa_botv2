@@ -319,6 +319,12 @@ function isAudioOnlyError(err) {
   return msg.includes('only .wav') || msg.includes('only .ogg') || msg.includes('only .mp3');
 }
 
+function isBadFileContentError(err) {
+  const data = err?.response?.data;
+  const msg = JSON.stringify(data || err?.message || '').toLowerCase();
+  return msg.includes('bad file content') || msg.includes('failed to recognize');
+}
+
 async function fetchAudioSampleBase64(audioUrl, maxBytes = 2_000_000) {
   // Avoid downloading the full file. Many servers support Range; if not, we still cap by truncating locally.
   const res = await axios.get(audioUrl, {
@@ -560,15 +566,48 @@ async function recognizeSongFromAudioUrl(audioUrl) {
     if (contentType.includes('application/x-www-form-urlencoded')) {
       const fileField = process.env.SHAZAM_FILE_FIELD || 'file';
       const mode = (process.env.SHAZAM_FILE_MODE || 'url').toLowerCase();
+      const sampleBytes = Number(process.env.SHAZAM_SAMPLE_BYTES || 8_000_000);
 
       const form = new URLSearchParams();
       if (mode === 'base64') {
-        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl);
+        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl, sampleBytes);
         let uploadBuf = buf;
+        let filename = 'sample.mp3';
+        let uploadType = 'audio/mpeg';
         if (srcType.includes('video/')) {
           uploadBuf = await convertToMp3(buf, 'mp4');
         }
+
+        // Some providers accept base64 in form field, some require multipart.
+        // Try base64 first; on "Bad file content", fall back to multipart upload below.
         form.set(fileField, uploadBuf.toString('base64'));
+
+        try {
+          res = await shazamClient.post(detectPath, form.toString(), {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+          });
+        } catch (err) {
+          if (!isBadFileContentError(err) && !isUploadFileExpectedError(err) && !isAudioOnlyError(err)) throw err;
+
+          const fd = new FormData();
+          fd.append(fileField, uploadBuf, { filename, contentType: uploadType });
+          res = await shazamClient.post(detectPath, fd, { headers: fd.getHeaders() });
+        }
+        // base64 branch handled fully
+        // eslint-disable-next-line no-lone-blocks
+        {
+          const track = res.data?.track || res.data?.data?.track || res.data?.result?.track || null;
+          const title = track?.title || null;
+          const artist = track?.subtitle || track?.artist || null;
+
+          if (!title && !artist) {
+            const e = new Error('Recognition API could not identify the track');
+            e.code = 'NO_MATCH';
+            throw e;
+          }
+
+          return { title, artist, raw: res.data };
+        }
       } else {
         // Many RapidAPI "Shazam Core" recognize endpoints accept a direct URL in "file".
         form.set(fileField, audioUrl);
@@ -580,9 +619,9 @@ async function recognizeSongFromAudioUrl(audioUrl) {
         });
       } catch (err) {
         // Some Shazam APIs require a multipart file upload, not a URL string.
-        if (!isUploadFileExpectedError(err) && !isAudioOnlyError(err)) throw err;
+        if (!isUploadFileExpectedError(err) && !isAudioOnlyError(err) && !isBadFileContentError(err)) throw err;
 
-        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl);
+        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl, sampleBytes);
         let uploadBuf = buf;
         let filename = 'sample.mp3';
         let uploadType = 'audio/mpeg';
