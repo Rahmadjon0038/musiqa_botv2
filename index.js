@@ -241,14 +241,18 @@ async function handleAdminStats(ctx) {
     const mediaCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM media_cache');
     const searchCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM search_cache');
     const broadcasts = await pool.query('SELECT COUNT(*)::bigint AS n FROM broadcasts');
+    const mediaN = Number(mediaCache.rows?.[0]?.n || 0);
+    const searchN = Number(searchCache.rows?.[0]?.n || 0);
     const text = [
       '📊 Statistika',
       '',
       `👤 Foydalanuvchilar: ${users.rows?.[0]?.n || 0}`,
-      `📦 Media cache: ${mediaCache.rows?.[0]?.n || 0}`,
-      `🔎 Search cache: ${searchCache.rows?.[0]?.n || 0}`,
+      mediaN ? `🎞️ Baza (saqlangan media): ${mediaN}` : null,
+      searchN ? `🔎 Baza (saqlangan qidiruvlar): ${searchN}` : null,
       `📣 Reklamalar: ${broadcasts.rows?.[0]?.n || 0}`
-    ].join('\n');
+    ]
+      .filter(Boolean)
+      .join('\n');
     await ctx.reply(text);
   } catch (e) {
     console.error('admin stats failed:', e?.message || e);
@@ -479,24 +483,51 @@ bot.on('text', async (ctx) => {
       adminState.delete(ctx.from.id);
       const status = await startLoader(ctx, 'Reklama yuborilyapti…');
       try {
+        const adFooter = process.env.AD_FOOTER || BRAND_FOOTER;
+        const hasTextOnly = Boolean(ctx.message?.text);
+        const broadcastText = hasTextOnly ? `${text}\n\n${adFooter}` : text;
+
         const created = await pool.query(
           'INSERT INTO broadcasts (created_by, text) VALUES ($1, $2) RETURNING id',
-          [ctx.from.id, text]
+          [ctx.from.id, broadcastText]
         );
         const broadcastId = created.rows?.[0]?.id;
 
         const res = await pool.query('SELECT telegram_id FROM users');
         const ids = res.rows.map((r) => Number(r.telegram_id)).filter(Boolean);
+        if (!ids.length) {
+          await status.stop(null, true);
+          await ctx.reply("Hali foydalanuvchilar yo‘q (users jadvali bo‘sh). Avval foydalanuvchilar botga /start bosishi kerak.");
+          return;
+        }
         let ok = 0;
         let fail = 0;
         for (const id of ids) {
           try {
-            const sent = await ctx.telegram.sendMessage(id, text);
-            if (broadcastId && sent?.message_id) {
-              await pool.query(
-                'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-                [broadcastId, id, sent.message_id]
-              );
+            if (hasTextOnly) {
+              const sent = await ctx.telegram.sendMessage(id, broadcastText);
+              if (broadcastId && sent?.message_id) {
+                await pool.query(
+                  'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+                  [broadcastId, id, sent.message_id]
+                );
+              }
+            } else {
+              // Copy the admin's message (photo/video/etc) and then send a footer text.
+              const copied = await ctx.telegram.copyMessage(id, ctx.chat.id, ctx.message.message_id);
+              if (broadcastId && copied?.message_id) {
+                await pool.query(
+                  'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+                  [broadcastId, id, copied.message_id]
+                );
+              }
+              const footerMsg = await ctx.telegram.sendMessage(id, adFooter);
+              if (broadcastId && footerMsg?.message_id) {
+                await pool.query(
+                  'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+                  [broadcastId, id, footerMsg.message_id]
+                );
+              }
             }
             ok++;
           } catch {
