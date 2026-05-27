@@ -300,12 +300,14 @@ async function downloadYouTubeMp3(id) {
   }
 
   const res = await ytDlClient.get(path, { params });
+  // Some providers return temporary “reserved_file”/placeholder URLs which quickly expire.
+  // Prefer non-reserved direct URLs.
   const mp3Url =
-    pickFirstUrl(res.data?.link) ||
-    pickFirstUrl(res.data?.url) ||
-    pickFirstUrl(res.data?.data) ||
-    pickFirstUrl(res.data?.result) ||
-    pickFirstUrl(res.data);
+    pickFirstUrlSkippingReserved(res.data?.link) ||
+    pickFirstUrlSkippingReserved(res.data?.url) ||
+    pickFirstUrlSkippingReserved(res.data?.data) ||
+    pickFirstUrlSkippingReserved(res.data?.result) ||
+    pickFirstUrlSkippingReserved(res.data);
   if (!mp3Url) throw new Error('MP3 API returned no downloadable URL');
   return { mp3Url, raw: res.data };
 }

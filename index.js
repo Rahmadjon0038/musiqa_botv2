@@ -186,6 +186,12 @@ setInterval(() => {
   deleteExpiredActionTokens().catch(() => {});
 }, 10 * 60_000).unref();
 
+// Prevent double-press spam on inline buttons.
+const inflightActions = new Set();
+function inflightKey(ctx, token) {
+  return `${ctx.from?.id || '0'}:${token}`;
+}
+
 const LOADER_FRAMES = ['⏳', '⌛️', '⏳', '⌛️'];
 async function startLoader(ctx, baseText) {
   let stopped = false;
@@ -1496,8 +1502,23 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
     // ignore
   }
 
+  const k = inflightKey(ctx, `s:${token}`);
+  if (inflightActions.has(k)) {
+    try {
+      await ctx.answerCbQuery('Iltimos, kuting…');
+    } catch {}
+    return;
+  }
+  inflightActions.add(k);
+
   try {
-    const { mp3Url } = await downloadYouTubeMp3(picked.id);
+    let mp3Url;
+    try {
+      mp3Url = (await downloadYouTubeMp3(picked.id)).mp3Url;
+    } catch (e) {
+      // Retry once: some providers return short-lived URLs.
+      mp3Url = (await downloadYouTubeMp3(picked.id)).mp3Url;
+    }
     await sendTelegramMedia(ctx, 'audio', mp3Url, `${picked.title}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(picked.id));
     try {
       // Remember the best pick for this query so next time we can send instantly from cache.
@@ -1508,7 +1529,15 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
     }
   } catch (err) {
     console.error('search pick download error:', err?.response?.data || err?.message || err);
-    await ctx.reply("MP3 yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
+    try {
+      await ctx.answerCbQuery("MP3 tayyor bo‘lmadi. Qayta urinib ko‘ring.", { show_alert: true });
+    } catch {}
+    // Avoid spamming chat with many identical messages on repeated clicks.
+    try {
+      await ctx.reply("MP3 yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
+    } catch {}
+  } finally {
+    inflightActions.delete(k);
   }
 });
 
@@ -1667,8 +1696,22 @@ bot.action(/^ym:(.+)$/, async (ctx) => {
   }
 
   const loader = await startLoader(ctx, 'MP3 tayyorlanyapti…');
+  const k = inflightKey(ctx, `ym:${token}`);
+  if (inflightActions.has(k)) {
+    await loader.stop(null, true);
+    try {
+      await ctx.answerCbQuery('Iltimos, kuting…');
+    } catch {}
+    return;
+  }
+  inflightActions.add(k);
   try {
-    const { mp3Url } = await downloadYouTubeMp3(entry.id);
+    let mp3Url;
+    try {
+      mp3Url = (await downloadYouTubeMp3(entry.id)).mp3Url;
+    } catch {
+      mp3Url = (await downloadYouTubeMp3(entry.id)).mp3Url;
+    }
     await loader.stop(null, true);
     const caption = [entry.title || 'YouTube MP3', '', BRAND_FOOTER].join('\n');
     await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id));
@@ -1676,6 +1719,8 @@ bot.action(/^ym:(.+)$/, async (ctx) => {
     await loader.stop(null, true);
     console.error('youtube mp3 by id error:', err?.response?.data || err?.message || err);
     await ctx.reply("MP3 yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
+  } finally {
+    inflightActions.delete(k);
   }
 });
 
