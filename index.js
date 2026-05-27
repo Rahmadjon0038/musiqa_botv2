@@ -9,7 +9,16 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 
-const { pool, initDb, getMediaCache, upsertMediaCache, getSearchCache, upsertSearchCache } = require('./config/db');
+const {
+  pool,
+  initDb,
+  getMediaCache,
+  upsertMediaCache,
+  getSearchCache,
+  upsertSearchCache,
+  getQueryBest,
+  upsertQueryBest
+} = require('./config/db');
 const {
   downloadAllMedia,
   searchYouTube,
@@ -98,6 +107,24 @@ async function searchYouTubeCached(query) {
     console.error('search cache write failed:', e?.message || e);
   }
   return { results: fresh.results, total: fresh.total, cached: false };
+}
+
+async function trySendBestMp3ForQuery(ctx, query) {
+  const queryKey = makeSearchQueryKey(query, 'youtube');
+  try {
+    const best = await getQueryBest(queryKey);
+    const bestId = best?.best_id;
+    if (!bestId) return false;
+
+    const mp3Cache = await getMediaCache(makeYouTubeMp3CacheKey(bestId));
+    if (mp3Cache?.file_id) {
+      const caption = [query, '', BRAND_FOOTER].join('\n');
+      return await trySendTelegramMediaByFileId(ctx, 'audio', mp3Cache.file_id, caption);
+    }
+  } catch (e) {
+    console.error('trySendBestMp3ForQuery failed:', e?.message || e);
+  }
+  return false;
 }
 
 // Short-lived in-memory cache for callback actions:
@@ -352,18 +379,31 @@ async function handleAdminBroadcastMessage(ctx) {
             );
           }
         } else {
-          const copied = await ctx.telegram.copyMessage(id, ctx.chat.id, ctx.message.message_id);
-          if (broadcastId && copied?.message_id) {
-            await pool.query(
-              'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-              [broadcastId, id, copied.message_id]
-            );
+          const captionBase = String(ctx.message?.caption || '').trim();
+          let caption = [captionBase, adFooter].filter(Boolean).join('\n\n');
+          if (caption.length > 1024) caption = caption.slice(0, 1020) + '…';
+
+          let sent;
+          if (ctx.message?.video?.file_id) {
+            sent = await ctx.telegram.sendVideo(id, ctx.message.video.file_id, { caption });
+          } else if (Array.isArray(ctx.message?.photo) && ctx.message.photo.length) {
+            const best = ctx.message.photo[ctx.message.photo.length - 1];
+            sent = await ctx.telegram.sendPhoto(id, best.file_id, { caption });
+          } else if (ctx.message?.animation?.file_id) {
+            sent = await ctx.telegram.sendAnimation(id, ctx.message.animation.file_id, { caption });
+          } else if (ctx.message?.document?.file_id) {
+            sent = await ctx.telegram.sendDocument(id, ctx.message.document.file_id, { caption });
+          } else {
+            // Fallback: unknown message type, copy as-is and send footer separately.
+            const copied = await ctx.telegram.copyMessage(id, ctx.chat.id, ctx.message.message_id);
+            sent = copied;
+            await ctx.telegram.sendMessage(id, adFooter);
           }
-          const footerMsg = await ctx.telegram.sendMessage(id, adFooter);
-          if (broadcastId && footerMsg?.message_id) {
+
+          if (broadcastId && sent?.message_id) {
             await pool.query(
               'INSERT INTO broadcast_messages (broadcast_id, telegram_id, message_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-              [broadcastId, id, footerMsg.message_id]
+              [broadcastId, id, sent.message_id]
             );
           }
         }
@@ -1311,11 +1351,15 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
 	  return;
 	}
 
-	// Search step is best-effort: never show "aniqlanmadi" if recognition already succeeded.
-	try {
-	  const searchLoader = await startLoader(ctx, 'YouTube’da qidiryapman…');
-	  const { results, total } = await searchYouTubeCached(query);
-	  await searchLoader.stop(null, true);
+		// Search step is best-effort: never show "aniqlanmadi" if recognition already succeeded.
+		try {
+		  // If a best match is already known and its MP3 is cached, send it without searching again.
+		  const served = await trySendBestMp3ForQuery(ctx, query);
+		  if (served) return;
+
+		  const searchLoader = await startLoader(ctx, 'YouTube’da qidiryapman…');
+		  const { results, total } = await searchYouTubeCached(query);
+		  await searchLoader.stop(null, true);
 	  const allUnique = [];
 	  const seen = new Set();
 	  for (const r of results || []) {
@@ -1376,6 +1420,13 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
   try {
     const { mp3Url } = await downloadYouTubeMp3(picked.id);
     await sendTelegramMedia(ctx, 'audio', mp3Url, `${picked.title}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(picked.id));
+    try {
+      // Remember the best pick for this query so next time we can send instantly from cache.
+      const qKey = makeSearchQueryKey(entry.query, 'youtube');
+      await upsertQueryBest({ queryKey: qKey, provider: 'youtube', bestId: picked.id });
+    } catch (e) {
+      console.error('upsertQueryBest failed:', e?.message || e);
+    }
   } catch (err) {
     console.error('search pick download error:', err?.response?.data || err?.message || err);
     await ctx.reply("MP3 yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");

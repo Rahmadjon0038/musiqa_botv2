@@ -71,6 +71,16 @@ async function initDb() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS query_best (
+      query_key TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      best_id TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS broadcasts (
       id BIGSERIAL PRIMARY KEY,
       created_by BIGINT,
@@ -154,3 +164,30 @@ async function upsertSearchCache({ queryKey, queryText, provider, results, total
 
 module.exports.getSearchCache = getSearchCache;
 module.exports.upsertSearchCache = upsertSearchCache;
+
+async function getQueryBest(queryKey) {
+  const res = await pool.query(
+    `SELECT query_key, provider, best_id
+     FROM query_best
+     WHERE query_key = $1
+     LIMIT 1`,
+    [queryKey]
+  );
+  return res.rows?.[0] || null;
+}
+
+async function upsertQueryBest({ queryKey, provider, bestId }) {
+  await pool.query(
+    `INSERT INTO query_best (query_key, provider, best_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (query_key)
+     DO UPDATE SET
+       provider = EXCLUDED.provider,
+       best_id = EXCLUDED.best_id,
+       updated_at = NOW()`,
+    [queryKey, provider, bestId]
+  );
+}
+
+module.exports.getQueryBest = getQueryBest;
+module.exports.upsertQueryBest = upsertQueryBest;
