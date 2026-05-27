@@ -885,37 +885,53 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
     // ignore
   }
 
-  try {
-    const sourceUrl = entry.audioUrl || entry.videoUrl;
-    if (!sourceUrl) {
-      await ctx.reply("Audio topilmadi. Iltimos, havolani qaytadan yuboring.");
-      return;
-    }
+	  try {
+	    const sourceUrl = entry.audioUrl || entry.videoUrl;
+	    if (!sourceUrl) {
+	      await ctx.reply("Audio topilmadi. Iltimos, havolani qaytadan yuboring.");
+	      return;
+	    }
 
-    const { title, artist } = await recognizeSongFromAudioUrl(sourceUrl);
-    const query = [artist, title].filter(Boolean).join(' - ') || title;
+	    const { title, artist } = await recognizeSongFromAudioUrl(sourceUrl);
+	    const query = [artist, title].filter(Boolean).join(' - ') || title;
 
-    const { results, total } = await searchYouTube(query);
-    const allUnique = [];
-    const seen = new Set();
-    for (const r of results || []) {
-      if (!r?.id || seen.has(r.id)) continue;
-      seen.add(r.id);
-      allUnique.push(r);
-      if (allUnique.length >= 50) break;
-    }
+	    // Always show recognition result first, even if YouTube API quota is exceeded.
+	    const ytWebUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+	    await ctx.reply(
+	      `Aniqlandi: ${query}\n\n${BRAND_FOOTER}`,
+	      Markup.inlineKeyboard([[Markup.button.url('🔎 YouTube’da qidirish', ytWebUrl)]])
+	    );
 
-    if (!allUnique.length) {
-      await ctx.reply("Qo‘shiq aniqlandi, lekin YouTube’da natija topilmadi.");
-      return;
-    }
+	    try {
+	      const { results, total } = await searchYouTube(query);
+	      const allUnique = [];
+	      const seen = new Set();
+	      for (const r of results || []) {
+	        if (!r?.id || seen.has(r.id)) continue;
+	        seen.add(r.id);
+	        allUnique.push(r);
+	        if (allUnique.length >= 50) break;
+	      }
 
-    const searchToken = putAction({ kind: 'search', query, results: allUnique, page: 0, total: total || null });
-    await sendSearchPage(ctx, searchToken);
-  } catch (err) {
-    console.error('recognize->search error:', err?.response?.data || err?.message || err);
-    if (err?.code === 'ECONNABORTED' || String(err?.message || '').toLowerCase().includes('timeout')) {
-      await ctx.reply("Qo‘shiqni aniqlash sekinlashdi (timeout). 1-2 daqiqadan keyin yana urinib ko‘ring.");
+	      if (!allUnique.length) {
+	        await ctx.reply("YouTube’da natija topilmadi.");
+	        return;
+	      }
+
+	      const searchToken = putAction({ kind: 'search', query, results: allUnique, page: 0, total: total || null });
+	      await sendSearchPage(ctx, searchToken);
+	    } catch (e) {
+	      const msg = String(e?.response?.data?.message || e?.message || '').toLowerCase();
+	      if (msg.includes('exceeded') && msg.includes('quota')) {
+	        await ctx.reply("YouTube qidiruv limiti tugagan. Hozircha tugmalar chiqmaydi, lekin yuqoridagi link orqali qidirib olasiz.");
+	        return;
+	      }
+	      throw e;
+	    }
+	  } catch (err) {
+	    console.error('recognize->search error:', err?.response?.data || err?.message || err);
+	    if (err?.code === 'ECONNABORTED' || String(err?.message || '').toLowerCase().includes('timeout')) {
+	      await ctx.reply("Qo‘shiqni aniqlash sekinlashdi (timeout). 1-2 daqiqadan keyin yana urinib ko‘ring.");
       return;
     }
     await ctx.reply("Kechirasiz, videodagi qo‘shiqni aniqlab bo‘lmadi. Keyinroq urinib ko‘ring.");
