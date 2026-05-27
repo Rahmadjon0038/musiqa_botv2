@@ -9,7 +9,7 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 
-const { pool, initDb, getMediaCache, upsertMediaCache } = require('./config/db');
+const { pool, initDb, getMediaCache, upsertMediaCache, getSearchCache, upsertSearchCache } = require('./config/db');
 const {
   downloadAllMedia,
   searchYouTube,
@@ -59,6 +59,37 @@ function makeYouTubeAudioCacheKey(videoId, quality) {
 
 function makeYouTubeMp3CacheKey(videoId) {
   return `yt:mp3:${videoId}`;
+}
+
+function makeSearchQueryKey(query, provider = 'youtube') {
+  return `search:${provider}:${sha1(String(query || '').trim().toLowerCase())}`;
+}
+
+async function searchYouTubeCached(query) {
+  const queryKey = makeSearchQueryKey(query, 'youtube');
+  const maxAgeMs = Number(process.env.SEARCH_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+  try {
+    const cached = await getSearchCache(queryKey, maxAgeMs);
+    if (cached?.results) {
+      return { results: cached.results, total: cached.total || null, cached: true };
+    }
+  } catch (e) {
+    console.error('search cache read failed:', e?.message || e);
+  }
+
+  const fresh = await searchYouTube(query);
+  try {
+    await upsertSearchCache({
+      queryKey,
+      queryText: query,
+      provider: 'youtube',
+      results: fresh.results || [],
+      total: fresh.total || null
+    });
+  } catch (e) {
+    console.error('search cache write failed:', e?.message || e);
+  }
+  return { results: fresh.results, total: fresh.total, cached: false };
 }
 
 // Short-lived in-memory cache for callback actions:
@@ -232,7 +263,12 @@ async function handleMediaLink(ctx, url) {
       try {
         const cached = await getMediaCache(linkKey);
         if (cached?.file_id) {
-          const token = putAction({ kind: 'recognize', audioUrl: null, videoUrl: url });
+          const cachedMeta = cached?.meta && typeof cached.meta === 'object' ? cached.meta : null;
+          const token = putAction({
+            kind: 'recognize',
+            audioUrl: cachedMeta?.audioUrl || null,
+            videoUrl: cachedMeta?.videoUrl || null
+          });
           await ctx.replyWithVideo(cached.file_id, {
             caption: BRAND_FOOTER,
             ...Markup.inlineKeyboard([Markup.button.callback("🎵 Qo‘shiqni yuklab olish", `rs:${token}`)], { columns: 1 })
@@ -331,7 +367,13 @@ async function handleMediaLink(ctx, url) {
       });
       try {
         // Cache both by the original link and by the resolved CDN URL.
-        const stored = await maybeCacheAndStore(ctx, 'video', makeUrlCacheKey('video', url), sent);
+        const stored = await maybeCacheAndStore(
+          ctx,
+          'video',
+          makeUrlCacheKey('video', url),
+          sent,
+          { videoUrl, audioUrl, title: title || null, source: 'short', originalUrl: url }
+        );
         if (stored?.fileId) {
           await upsertMediaCache({
             cacheKey: makeUrlCacheKey('video', videoUrl),
@@ -339,7 +381,7 @@ async function handleMediaLink(ctx, url) {
             fileId: stored.fileId,
             storageChatId: stored.storageChatId,
             storageMessageId: stored.storageMessageId,
-            meta: null
+            meta: { videoUrl, audioUrl, title: title || null, source: 'short', originalUrl: url }
           });
         }
       } catch (e) {
@@ -672,7 +714,7 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
 async function handleMusicSearch(ctx, query) {
   try {
     await ctx.reply('Qidiryapman…');
-    const { results, total } = await searchYouTube(query);
+    const { results, total } = await searchYouTubeCached(query);
 
     const allUnique = [];
     const seen = new Set();
@@ -841,12 +883,14 @@ bot.action(/^id:(.+)$/, async (ctx) => {
   try {
     const { title, artist } = await recognizeSongFromAudioUrl(entry.url);
     const fullQuery = [artist, title].filter(Boolean).join(' - ') || title;
-    await ctx.reply(`Aniqlandi: ${fullQuery}\n\n${BRAND_FOOTER}`);
+	    await ctx.reply(`Aniqlandi: ${fullQuery}\n\n${BRAND_FOOTER}`);
 
-    const { id } = await searchYouTube(fullQuery);
-    const { mp3Url } = await downloadYouTubeMp3(id);
-    await sendTelegramMedia(ctx, 'audio', mp3Url, `${fullQuery}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(id));
-  } catch (err) {
+	    const { results } = await searchYouTubeCached(fullQuery);
+	    const id = results?.[0]?.id;
+	    if (!id) throw new Error('No YouTube results found');
+	    const { mp3Url } = await downloadYouTubeMp3(id);
+	    await sendTelegramMedia(ctx, 'audio', mp3Url, `${fullQuery}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(id));
+	  } catch (err) {
     console.error('identify error:', err?.response?.data || err?.message || err);
     const status = err?.response?.status;
     if (status === 429 || err?.code === 'RAPIDAPI_LIMIT') {
@@ -896,14 +940,10 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
 	    const query = [artist, title].filter(Boolean).join(' - ') || title;
 
 	    // Always show recognition result first, even if YouTube API quota is exceeded.
-	    const ytWebUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-	    await ctx.reply(
-	      `Aniqlandi: ${query}\n\n${BRAND_FOOTER}`,
-	      Markup.inlineKeyboard([[Markup.button.url('🔎 YouTube’da qidirish', ytWebUrl)]])
-	    );
+	    await ctx.reply(`Aniqlandi: ${query}\n\n${BRAND_FOOTER}`);
 
 	    try {
-	      const { results, total } = await searchYouTube(query);
+	      const { results, total } = await searchYouTubeCached(query);
 	      const allUnique = [];
 	      const seen = new Set();
 	      for (const r of results || []) {
@@ -923,7 +963,7 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
 	    } catch (e) {
 	      const msg = String(e?.response?.data?.message || e?.message || '').toLowerCase();
 	      if (msg.includes('exceeded') && msg.includes('quota')) {
-	        await ctx.reply("YouTube qidiruv limiti tugagan. Hozircha tugmalar chiqmaydi, lekin yuqoridagi link orqali qidirib olasiz.");
+	        await ctx.reply("YouTube qidiruv limiti tugagan. Hozircha MP3 topib bo‘lmaydi. Keyinroq urinib ko‘ring.");
 	        return;
 	      }
 	      throw e;
@@ -1282,7 +1322,7 @@ async function trySendTelegramMediaByFileId(ctx, kind, fileId, caption) {
   }
 }
 
-async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage) {
+async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage, metaOverride = null) {
   if (!cacheKey || !sentMessage) return;
   const fileId = extractFileIdFromMessage(kind, sentMessage);
   if (!fileId) return;
@@ -1308,7 +1348,7 @@ async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage) {
       fileId,
       storageChatId: storageChatId || null,
       storageMessageId,
-      meta: null
+      meta: metaOverride
     });
   } catch (e) {
     console.error('cache upsert failed:', e?.message || e);

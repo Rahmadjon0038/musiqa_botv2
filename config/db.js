@@ -57,6 +57,18 @@ async function initDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS search_cache (
+      query_key TEXT PRIMARY KEY,
+      query_text TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      results JSONB NOT NULL,
+      total BIGINT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 }
 
 async function getMediaCache(cacheKey) {
@@ -87,3 +99,38 @@ async function upsertMediaCache({ cacheKey, kind, fileId, storageChatId = null, 
 }
 
 module.exports = { pool, initDb, getMediaCache, upsertMediaCache };
+
+async function getSearchCache(queryKey, maxAgeMs) {
+  const res = await pool.query(
+    `SELECT query_key, query_text, provider, results, total, created_at
+     FROM search_cache
+     WHERE query_key = $1
+     LIMIT 1`,
+    [queryKey]
+  );
+  const row = res.rows?.[0] || null;
+  if (!row) return null;
+  if (maxAgeMs != null) {
+    const createdAt = row.created_at ? new Date(row.created_at).getTime() : 0;
+    if (!createdAt || Date.now() - createdAt > maxAgeMs) return null;
+  }
+  return row;
+}
+
+async function upsertSearchCache({ queryKey, queryText, provider, results, total = null }) {
+  await pool.query(
+    `INSERT INTO search_cache (query_key, query_text, provider, results, total)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (query_key)
+     DO UPDATE SET
+       query_text = EXCLUDED.query_text,
+       provider = EXCLUDED.provider,
+       results = EXCLUDED.results,
+       total = EXCLUDED.total,
+       updated_at = NOW()`,
+    [queryKey, queryText, provider, results, total]
+  );
+}
+
+module.exports.getSearchCache = getSearchCache;
+module.exports.upsertSearchCache = upsertSearchCache;
