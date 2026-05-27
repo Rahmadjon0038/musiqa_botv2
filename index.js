@@ -716,10 +716,18 @@ async function handleMediaLink(ctx, url) {
       const audioButton = audioUrl
         ? Markup.button.callback("🎵 Audioni yuklab olish", `dl:a:${putAction({ kind: 'audio', url: audioUrl })}`)
         : null;
+      const fallbackVideoId = extractYouTubeId(url);
+      const mp3Button = fallbackVideoId
+        ? Markup.button.callback(
+            "🎵 Musiqani yuklab olish (MP3)",
+            `ym:${putAction({ kind: 'ytmp3', id: fallbackVideoId, title: title || null })}`
+          )
+        : null;
 
       const keyboardRows = [];
       for (const row of chunk(videoButtons, 2)) keyboardRows.push(row);
       if (audioButton) keyboardRows.push([audioButton]);
+      if (mp3Button) keyboardRows.push([mp3Button]);
 
       const header = title ? `🍿 ${title}` : 'YouTube video';
       const text = [header, url, '', BRAND_FOOTER].filter(Boolean).join('\n');
