@@ -40,6 +40,14 @@ const MAX_TELEGRAM_UPLOAD_BYTES = Number(process.env.MAX_TELEGRAM_UPLOAD_BYTES |
 const STORAGE_CHAT_ID = process.env.STORAGE_CHAT_ID || process.env.STORAGE_CHANNEL_ID || null;
 let BOT_USERNAME = process.env.BOT_USERNAME || null;
 let BOT_ID = process.env.BOT_ID ? Number(process.env.BOT_ID) : null;
+const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map((s) => Number(s))
+  .filter((n) => Number.isFinite(n));
+
+const adminState = new Map(); // telegram_id -> { mode: 'broadcast' }
 
 function sha1(text) {
   return crypto.createHash('sha1').update(String(text || ''), 'utf8').digest('hex');
@@ -121,6 +129,51 @@ function cleanupActions() {
 }
 setInterval(cleanupActions, 60_000).unref();
 
+const LOADER_FRAMES = ['⏳', '⌛️', '⏳', '⌛️'];
+async function startLoader(ctx, baseText) {
+  let stopped = false;
+  let msg;
+  try {
+    msg = await ctx.reply(`${LOADER_FRAMES[0]} ${baseText}`);
+  } catch {
+    return { stop: async () => {}, messageId: null };
+  }
+
+  const chatId = ctx.chat?.id;
+  const messageId = msg?.message_id;
+  if (!chatId || !messageId) return { stop: async () => {}, messageId: null };
+
+  let i = 0;
+  const intervalMs = Number(process.env.LOADER_INTERVAL_MS || 1200);
+  const timer = setInterval(async () => {
+    if (stopped) return;
+    i = (i + 1) % LOADER_FRAMES.length;
+    try {
+      await ctx.telegram.editMessageText(chatId, messageId, undefined, `${LOADER_FRAMES[i]} ${baseText}`);
+    } catch {
+      // ignore edit errors (message deleted, rate limits, etc.)
+    }
+  }, intervalMs);
+  timer.unref?.();
+
+  return {
+    messageId,
+    stop: async (finalText = null, remove = true) => {
+      stopped = true;
+      clearInterval(timer);
+      try {
+        if (finalText) {
+          await ctx.telegram.editMessageText(chatId, messageId, undefined, finalText);
+        } else if (remove) {
+          await ctx.telegram.deleteMessage(chatId, messageId);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  };
+}
+
 const SUPPORTED_URL_REGEX =
   /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be|instagram\.com|tiktok\.com)\/\S+/i;
 
@@ -157,6 +210,24 @@ function mentionsBot(text) {
   return new RegExp(`\\B@${BOT_USERNAME}\\b`, 'i').test(t);
 }
 
+function isAdmin(ctx) {
+  const id = ctx.from?.id;
+  return Boolean(id && ADMIN_IDS.includes(Number(id)));
+}
+
+async function adminPanel(ctx) {
+  await ctx.reply(
+    '🔐 Admin panel',
+    Markup.inlineKeyboard(
+      [
+        [Markup.button.callback('📊 Statistika', 'adm:stats')],
+        [Markup.button.callback('📣 Reklama yuborish', 'adm:bcast')]
+      ],
+      { columns: 1 }
+    )
+  );
+}
+
 bot.start(async (ctx) => {
   try {
     const telegramId = ctx.from?.id;
@@ -179,12 +250,13 @@ bot.start(async (ctx) => {
 
   await ctx.reply(
     [
-      "YouTube / TikTok / Instagram havolasini yuboring — yuklab beraman.",
-      "Yoki qo‘shiq nomini (matn) yuboring — qidirib MP3 qilib yuboraman.",
+      'Salom men Navobotman!',
       '',
-      'Eslatma:',
-      '- Havola yuborsangiz: Video / MP3 tugmalari chiqadi.',
-      "- Instagram/TikTok: qo‘shiqni aniqlash (🔎 Identify Song) ham bor."
+      '✅ Mening xususiyatlarim bilan tanishing:',
+      '',
+      ' • Qo‘shiq matni, nomi yoki ijrochi ismi orqali musiqa topaman',
+      '',
+      ' • Instagram, Youtube va Tik-Tokdan video va undagi musiqani yuklab beraman'
     ].join('\n')
   );
 });
@@ -205,6 +277,44 @@ bot.command('storageid', async (ctx) => {
       "Keyin `.env` ga qo‘shasiz: STORAGE_CHAT_ID=-100..."
     ].join('\n')
   );
+});
+
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await adminPanel(ctx);
+});
+
+bot.action('adm:stats', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    await ctx.answerCbQuery('Yig‘ilyapti…');
+  } catch {}
+
+  try {
+    const users = await pool.query('SELECT COUNT(*)::bigint AS n FROM users');
+    const mediaCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM media_cache');
+    const searchCache = await pool.query('SELECT COUNT(*)::bigint AS n FROM search_cache');
+    const text = [
+      '📊 Statistika',
+      '',
+      `👤 Foydalanuvchilar: ${users.rows?.[0]?.n || 0}`,
+      `📦 Media cache: ${mediaCache.rows?.[0]?.n || 0}`,
+      `🔎 Search cache: ${searchCache.rows?.[0]?.n || 0}`
+    ].join('\n');
+    await ctx.reply(text);
+  } catch (e) {
+    console.error('admin stats failed:', e?.message || e);
+    await ctx.reply('Statistika olishda xatolik bo‘ldi.');
+  }
+});
+
+bot.action('adm:bcast', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    await ctx.answerCbQuery('OK');
+  } catch {}
+  adminState.set(ctx.from.id, { mode: 'broadcast' });
+  await ctx.reply('Reklama matnini yuboring (keyingi xabaringiz hamma foydalanuvchilarga ketadi).');
 });
 
 bot.use(async (ctx, next) => {
@@ -230,6 +340,37 @@ bot.on('channel_post', async (ctx) => {
 bot.on('text', async (ctx) => {
   const text = (ctx.message?.text || '').trim();
   if (!text) return;
+
+  // Admin broadcast mode (private chats only).
+  if (ctx.chat?.type === 'private' && isAdmin(ctx)) {
+    const st = adminState.get(ctx.from.id);
+    if (st?.mode === 'broadcast') {
+      adminState.delete(ctx.from.id);
+      const status = await startLoader(ctx, 'Reklama yuborilyapti…');
+      try {
+        const res = await pool.query('SELECT telegram_id FROM users');
+        const ids = res.rows.map((r) => Number(r.telegram_id)).filter(Boolean);
+        let ok = 0;
+        let fail = 0;
+        for (const id of ids) {
+          try {
+            await ctx.telegram.sendMessage(id, text);
+            ok++;
+          } catch {
+            fail++;
+          }
+          await new Promise((r) => setTimeout(r, 60));
+        }
+        await status.stop(null, true);
+        await ctx.reply(`✅ Yuborildi: ${ok}\n❌ Xato: ${fail}`);
+      } catch (e) {
+        await status.stop(null, true);
+        console.error('broadcast failed:', e?.message || e);
+        await ctx.reply('Reklama yuborishda xatolik bo‘ldi.');
+      }
+      return;
+    }
+  }
 
   // In groups, avoid responding to every message:
   // - Always allow supported URLs
@@ -267,7 +408,8 @@ async function handleMediaLink(ctx, url) {
           const token = putAction({
             kind: 'recognize',
             audioUrl: cachedMeta?.audioUrl || null,
-            videoUrl: cachedMeta?.videoUrl || null
+            videoUrl: cachedMeta?.videoUrl || null,
+            originalUrl: cachedMeta?.originalUrl || url
           });
           await ctx.replyWithVideo(cached.file_id, {
             caption: BRAND_FOOTER,
@@ -280,8 +422,9 @@ async function handleMediaLink(ctx, url) {
       }
     }
 
-    await ctx.reply('Yuklab olish havolalarini topyapman…');
+    const loader = await startLoader(ctx, 'Yuklab olish havolalarini topyapman…');
     const { videoUrl, audioUrl, title, raw } = await downloadAllMedia(url);
+    await loader.stop(null, true);
 
     const buttons = [];
 
@@ -712,8 +855,8 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
 }
 
 async function handleMusicSearch(ctx, query) {
+  const loader = await startLoader(ctx, 'Qidiryapman…');
   try {
-    await ctx.reply('Qidiryapman…');
     const { results, total } = await searchYouTubeCached(query);
 
     const allUnique = [];
@@ -726,13 +869,16 @@ async function handleMusicSearch(ctx, query) {
     }
 
     if (!allUnique.length) {
+      await loader.stop(null, true);
       await ctx.reply("Hech narsa topilmadi. Boshqa so‘z bilan urinib ko‘ring.");
       return;
     }
 
     const token = putAction({ kind: 'search', query, results: allUnique, page: 0, total: total || null });
+    await loader.stop(null, true);
     await sendSearchPage(ctx, token);
   } catch (err) {
+    await loader.stop(null, true);
     console.error('handleMusicSearch error:', err?.response?.data || err?.message || err);
     const status = err?.response?.status;
     const msg = String(err?.response?.data?.message || err?.message || '').toLowerCase();
@@ -923,59 +1069,93 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
     return;
   }
 
-  try {
-    await ctx.answerCbQuery('Qidiryapman…');
-  } catch {
-    // ignore
-  }
+	try {
+	  await ctx.answerCbQuery('Qidiryapman…');
+	} catch {
+	  // ignore
+	}
 
-	  try {
-	    const sourceUrl = entry.audioUrl || entry.videoUrl;
-	    if (!sourceUrl) {
-	      await ctx.reply("Audio topilmadi. Iltimos, havolani qaytadan yuboring.");
-	      return;
-	    }
-
-	    const { title, artist } = await recognizeSongFromAudioUrl(sourceUrl);
-	    const query = [artist, title].filter(Boolean).join(' - ') || title;
-
-	    // Always show recognition result first, even if YouTube API quota is exceeded.
-	    await ctx.reply(`Aniqlandi: ${query}\n\n${BRAND_FOOTER}`);
-
+	const loader = await startLoader(ctx, 'Qo‘shiqni aniqlayapman…');
+	let query = null;
+	try {
+	  let sourceUrl = entry.audioUrl || entry.videoUrl;
+	  const originalUrl = entry.originalUrl || null;
+	  if (!sourceUrl && originalUrl) {
 	    try {
-	      const { results, total } = await searchYouTubeCached(query);
-	      const allUnique = [];
-	      const seen = new Set();
-	      for (const r of results || []) {
-	        if (!r?.id || seen.has(r.id)) continue;
-	        seen.add(r.id);
-	        allUnique.push(r);
-	        if (allUnique.length >= 50) break;
-	      }
-
-	      if (!allUnique.length) {
-	        await ctx.reply("YouTube’da natija topilmadi.");
-	        return;
-	      }
-
-	      const searchToken = putAction({ kind: 'search', query, results: allUnique, page: 0, total: total || null });
-	      await sendSearchPage(ctx, searchToken);
+	      const m = await downloadAllMedia(originalUrl);
+	      sourceUrl = m.audioUrl || m.videoUrl || null;
 	    } catch (e) {
-	      const msg = String(e?.response?.data?.message || e?.message || '').toLowerCase();
-	      if (msg.includes('exceeded') && msg.includes('quota')) {
-	        await ctx.reply("YouTube qidiruv limiti tugagan. Hozircha MP3 topib bo‘lmaydi. Keyinroq urinib ko‘ring.");
-	        return;
+	      console.error('recognize fallback downloadAllMedia failed:', e?.response?.data || e?.message || e);
+	    }
+	  }
+	  if (!sourceUrl) {
+	    await ctx.reply("Audio topilmadi. Iltimos, havolani qaytadan yuboring.");
+	    return;
+	  }
+
+	  let recognized;
+	  try {
+	    recognized = await recognizeSongFromAudioUrl(sourceUrl);
+	  } catch (e) {
+	    // If recognition failed because the source URL isn't a direct media file, retry via downloader using original link.
+	    if ((e?.code === 'NOT_MEDIA' || String(e?.message || '') === 'NOT_MEDIA') && originalUrl) {
+	      const m = await downloadAllMedia(originalUrl);
+	      const retryUrl = m.audioUrl || m.videoUrl || null;
+	      if (retryUrl) {
+	        recognized = await recognizeSongFromAudioUrl(retryUrl);
+	      } else {
+	        throw e;
 	      }
+	    } else {
 	      throw e;
 	    }
-	  } catch (err) {
-	    console.error('recognize->search error:', err?.response?.data || err?.message || err);
-	    if (err?.code === 'ECONNABORTED' || String(err?.message || '').toLowerCase().includes('timeout')) {
-	      await ctx.reply("Qo‘shiqni aniqlash sekinlashdi (timeout). 1-2 daqiqadan keyin yana urinib ko‘ring.");
-      return;
-    }
-    await ctx.reply("Kechirasiz, videodagi qo‘shiqni aniqlab bo‘lmadi. Keyinroq urinib ko‘ring.");
-  }
+	  }
+
+	  const { title, artist } = recognized;
+	  query = [artist, title].filter(Boolean).join(' - ') || title;
+	  await loader.stop(null, true);
+	  await ctx.reply(`Aniqlandi: ${query}\n\n${BRAND_FOOTER}`);
+	} catch (err) {
+	  await loader.stop(null, true);
+	  console.error('recognize error:', err?.response?.data || err?.message || err);
+	  if (err?.code === 'ECONNABORTED' || String(err?.message || '').toLowerCase().includes('timeout')) {
+	    await ctx.reply("Musiqani topib bo‘lmadi. Keyinroq urinib ko‘ring.");
+	    return;
+	  }
+	  await ctx.reply("Musiqani topib bo‘lmadi.");
+	  return;
+	}
+
+	// Search step is best-effort: never show "aniqlanmadi" if recognition already succeeded.
+	try {
+	  const searchLoader = await startLoader(ctx, 'YouTube’da qidiryapman…');
+	  const { results, total } = await searchYouTubeCached(query);
+	  await searchLoader.stop(null, true);
+	  const allUnique = [];
+	  const seen = new Set();
+	  for (const r of results || []) {
+	    if (!r?.id || seen.has(r.id)) continue;
+	    seen.add(r.id);
+	    allUnique.push(r);
+	    if (allUnique.length >= 50) break;
+	  }
+
+	  if (!allUnique.length) {
+	    await ctx.reply("YouTube’da natija topilmadi.");
+	    return;
+	  }
+
+	  const searchToken = putAction({ kind: 'search', query, results: allUnique, page: 0, total: total || null });
+	  await sendSearchPage(ctx, searchToken);
+	} catch (e) {
+	  console.error('recognize->search error:', e?.response?.data || e?.message || e);
+	  const msg = String(e?.response?.data?.message || e?.message || '').toLowerCase();
+	  if (msg.includes('exceeded') && msg.includes('quota')) {
+	    await ctx.reply("YouTube qidiruv limiti tugagan. Hozircha MP3 topib bo‘lmaydi. Keyinroq urinib ko‘ring.");
+	    return;
+	  }
+	  await ctx.reply("YouTube qidiruvi ishlamayapti. Keyinroq urinib ko‘ring.");
+	}
 });
 
 bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
@@ -1369,6 +1549,7 @@ async function start() {
   await initDb();
   console.log('DB connected and users table is ready');
   console.log('Storage configured:', { STORAGE_CHAT_ID: STORAGE_CHAT_ID || null });
+  console.log('Admin configured:', { adminCount: ADMIN_IDS.length });
 
   app.listen(PORT, () => {
     console.log(`Express server listening on port ${PORT}`);
