@@ -9,7 +9,7 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 
-const { pool, initDb } = require('./config/db');
+const { pool, initDb, getMediaCache, upsertMediaCache } = require('./config/db');
 const {
   downloadAllMedia,
   searchYouTube,
@@ -37,6 +37,27 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const BRAND_FOOTER = '🤖 @Navobot_bot birinchi raqamli yuklovchi bot';
 const MAX_TELEGRAM_UPLOAD_BYTES = Number(process.env.MAX_TELEGRAM_UPLOAD_BYTES || 49 * 1024 * 1024);
+const STORAGE_CHAT_ID = process.env.STORAGE_CHAT_ID || process.env.STORAGE_CHANNEL_ID || null;
+
+function sha1(text) {
+  return crypto.createHash('sha1').update(String(text || ''), 'utf8').digest('hex');
+}
+
+function makeUrlCacheKey(kind, url) {
+  return `url:${kind}:${sha1(String(url || '').trim().toLowerCase())}`;
+}
+
+function makeYouTubeVideoCacheKey(videoId, quality) {
+  return `yt:video:${videoId}:${quality}`;
+}
+
+function makeYouTubeAudioCacheKey(videoId, quality) {
+  return `yt:audio:${videoId}:${quality}`;
+}
+
+function makeYouTubeMp3CacheKey(videoId) {
+  return `yt:mp3:${videoId}`;
+}
 
 // Short-lived in-memory cache for callback actions:
 // token -> { kind: 'video'|'audio'|'identify'|'search'|'recognize', url, fallbackUrl?, createdAt, ... }
@@ -130,6 +151,24 @@ bot.on('text', async (ctx) => {
   }
 
   await handleMusicSearch(ctx, text);
+});
+
+bot.command('storageid', async (ctx) => {
+  await ctx.reply(
+    "Storage kanal ID sini olish uchun shu kanaldan istalgan postni botga FORWARD qiling. Men sizga `STORAGE_CHAT_ID` ni chiqarib beraman."
+  );
+});
+
+bot.use(async (ctx, next) => {
+  const msg = ctx.message;
+  const forwarded = msg?.forward_from_chat;
+  if (forwarded?.type === 'channel' && forwarded?.id) {
+    await ctx.reply(
+      `Forward qilingan kanal ID: ${forwarded.id}\n.env ga qo‘shing: STORAGE_CHAT_ID=${forwarded.id}`
+    );
+    return;
+  }
+  return next();
 });
 
 async function handleMediaLink(ctx, url) {
@@ -664,14 +703,15 @@ bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
           entry.url,
           BRAND_FOOTER,
           entry.fallbackUrl,
-          entry.expectedHeight
+          entry.expectedHeight,
+          makeUrlCacheKey('video', entry.url)
         ),
         120_000
       );
       if (!ok) throw new Error('VIDEO_SEND_FAILED');
     } else {
       const ok = await withTimeout(
-        sendTelegramMedia(ctx, 'audio', entry.url, BRAND_FOOTER, entry.fallbackUrl),
+        sendTelegramMedia(ctx, 'audio', entry.url, BRAND_FOOTER, entry.fallbackUrl, undefined, makeUrlCacheKey('audio', entry.url)),
         120_000
       );
       if (!ok) throw new Error('AUDIO_SEND_FAILED');
@@ -717,13 +757,7 @@ bot.action(/^id:(.+)$/, async (ctx) => {
 
     const { id } = await searchYouTube(fullQuery);
     const { mp3Url } = await downloadYouTubeMp3(id);
-
-    try {
-      await ctx.replyWithAudio(mp3Url, { caption: `${fullQuery}\n\n${BRAND_FOOTER}` });
-    } catch (sendErr) {
-      console.error('replyWithAudio (identified) failed:', sendErr?.message || sendErr);
-      await ctx.reply("Qo‘shiq aniqlandi, lekin Telegram MP3 ni URL orqali yuklay olmadi. Keyinroq urinib ko‘ring.");
-    }
+    await sendTelegramMedia(ctx, 'audio', mp3Url, `${fullQuery}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(id));
   } catch (err) {
     console.error('identify error:', err?.response?.data || err?.message || err);
     const status = err?.response?.status;
@@ -828,7 +862,7 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
 
   try {
     const { mp3Url } = await downloadYouTubeMp3(picked.id);
-    await sendTelegramMedia(ctx, 'audio', mp3Url, `${picked.title}\n\n${BRAND_FOOTER}`);
+    await sendTelegramMedia(ctx, 'audio', mp3Url, `${picked.title}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(picked.id));
   } catch (err) {
     console.error('search pick download error:', err?.response?.data || err?.message || err);
     await ctx.reply("MP3 yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
@@ -879,7 +913,7 @@ bot.action(/^ya:(.+)$/, async (ctx) => {
   try {
     const { mp3Url } = await downloadYouTubeMp3(entry.id);
     const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
-    await sendTelegramMedia(ctx, 'audio', mp3Url, caption);
+    await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id));
   } catch (err) {
     console.error('youtube audio download error:', err?.response?.data || err?.message || err);
     await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
@@ -916,7 +950,15 @@ bot.action(/^yv:(.+)$/, async (ctx) => {
     }
 
     const qLabel = labelFromQualityId(entry.quality);
-    await sendTelegramMedia(ctx, 'video', chosen, `${qLabel}\n${BRAND_FOOTER}`, undefined, qLabel);
+    await sendTelegramMedia(
+      ctx,
+      'video',
+      chosen,
+      `${qLabel}\n${BRAND_FOOTER}`,
+      undefined,
+      qLabel,
+      makeYouTubeVideoCacheKey(entry.id, entry.quality)
+    );
   } catch (err) {
     console.error(
       'youtube video download error:',
@@ -953,7 +995,7 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
       return;
     }
     const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
-    await sendTelegramMedia(ctx, 'audio', chosen, caption);
+    await sendTelegramMedia(ctx, 'audio', chosen, caption, undefined, undefined, makeYouTubeAudioCacheKey(entry.id, entry.quality));
   } catch (err) {
     console.error(
       'youtube audio (quality) error:',
@@ -990,14 +1032,36 @@ async function waitUntilReady(urls, maxWaitMs) {
   return null;
 }
 
-async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight) {
+async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight, cacheKeyOverride) {
+  const cacheKey =
+    cacheKeyOverride ||
+    (() => {
+      if (!url) return null;
+      if (kind === 'video' || kind === 'audio') return makeUrlCacheKey(kind, url);
+      return null;
+    })();
+
+  if (cacheKey) {
+    try {
+      const cached = await getMediaCache(cacheKey);
+      if (cached?.file_id) {
+        const ok = await trySendTelegramMediaByFileId(ctx, kind, cached.file_id, caption);
+        if (ok) return true;
+      }
+    } catch (e) {
+      console.error('cache lookup/send failed:', e?.message || e);
+    }
+  }
+
   // 1) Try by URL (fast path). Telegram may fail if URL is blocked/temporary/too large.
   try {
+    let sent;
     if (kind === 'video') {
-      await ctx.replyWithVideo(url, { caption });
+      sent = await ctx.replyWithVideo(url, { caption });
     } else {
-      await ctx.replyWithAudio(url, { caption });
+      sent = await ctx.replyWithAudio(url, { caption });
     }
+    await maybeCacheAndStore(ctx, kind, cacheKey, sent);
     return true;
   } catch (err) {
     // Continue to fallback: download then upload.
@@ -1044,11 +1108,13 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
     });
 
     const source = fs.createReadStream(filePath);
+    let sent;
     if (kind === 'video') {
-      await ctx.replyWithVideo({ source }, { caption });
+      sent = await ctx.replyWithVideo({ source }, { caption });
     } else {
-      await ctx.replyWithAudio({ source }, { caption });
+      sent = await ctx.replyWithAudio({ source }, { caption });
     }
+    await maybeCacheAndStore(ctx, kind, cacheKey, sent);
     return true;
   } catch (err) {
     if (err?.message === 'FILE_TOO_LARGE') {
@@ -1066,12 +1132,12 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
         );
         return false;
       }
-      if (fallbackUrl && fallbackUrl !== url) return await sendTelegramMedia(ctx, kind, fallbackUrl, caption);
+      if (fallbackUrl && fallbackUrl !== url) return await sendTelegramMedia(ctx, kind, fallbackUrl, caption, undefined, expectedHeight, cacheKey);
       await ctx.reply("Bu format hozir ishlamayapti. Boshqa sifatni tanlang.");
       return false;
     }
     if (fallbackUrl && fallbackUrl !== url) {
-      return await sendTelegramMedia(ctx, kind, fallbackUrl, caption);
+      return await sendTelegramMedia(ctx, kind, fallbackUrl, caption, undefined, expectedHeight, cacheKey);
     }
     throw err;
   } finally {
@@ -1080,6 +1146,61 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
     } catch {
       // ignore
     }
+  }
+}
+
+function extractFileIdFromMessage(kind, msg) {
+  if (!msg) return null;
+  if (kind === 'video') {
+    return msg.video?.file_id || msg.document?.file_id || null;
+  }
+  if (kind === 'audio') {
+    return msg.audio?.file_id || msg.voice?.file_id || msg.document?.file_id || null;
+  }
+  return null;
+}
+
+async function trySendTelegramMediaByFileId(ctx, kind, fileId, caption) {
+  try {
+    if (kind === 'video') {
+      await ctx.replyWithVideo(fileId, { caption });
+    } else {
+      await ctx.replyWithAudio(fileId, { caption });
+    }
+    return true;
+  } catch (e) {
+    console.error('file_id send failed:', e?.message || e);
+    return false;
+  }
+}
+
+async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage) {
+  if (!cacheKey || !sentMessage) return;
+  const fileId = extractFileIdFromMessage(kind, sentMessage);
+  if (!fileId) return;
+
+  let storageMessageId = null;
+  const storageChatId = STORAGE_CHAT_ID ? String(STORAGE_CHAT_ID) : null;
+  if (storageChatId) {
+    try {
+      const copied = await ctx.telegram.copyMessage(storageChatId, ctx.chat.id, sentMessage.message_id);
+      storageMessageId = copied?.message_id || null;
+    } catch (e) {
+      console.error('copy to storage failed:', e?.response?.description || e?.message || e);
+    }
+  }
+
+  try {
+    await upsertMediaCache({
+      cacheKey,
+      kind,
+      fileId,
+      storageChatId: storageChatId || null,
+      storageMessageId,
+      meta: null
+    });
+  } catch (e) {
+    console.error('cache upsert failed:', e?.message || e);
   }
 }
 
