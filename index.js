@@ -279,6 +279,30 @@ bot.command('storageid', async (ctx) => {
   );
 });
 
+bot.command('myid', async (ctx) => {
+  const id = ctx.from?.id;
+  const username = ctx.from?.username || null;
+  const name = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || null;
+  console.log('myid:', { id: id || null, username, name });
+  if (!id) {
+    await ctx.reply('ID topilmadi.');
+    return;
+  }
+  await ctx.reply(`Sizning Telegram ID: ${id}`);
+});
+
+bot.command('whois', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const reply = ctx.message?.reply_to_message;
+  const u = reply?.from;
+  if (!u?.id) {
+    await ctx.reply('Biror foydalanuvchi xabariga reply qilib `/whois` yozing.', { parse_mode: 'Markdown' });
+    return;
+  }
+  console.log('whois:', { id: u.id, username: u.username || null, name: [u.first_name, u.last_name].filter(Boolean).join(' ') || null });
+  await ctx.reply(`Telegram ID: ${u.id}\nUsername: ${u.username ? '@' + u.username : '-'}`);
+});
+
 bot.command('admin', async (ctx) => {
   if (!isAdmin(ctx)) return;
   await adminPanel(ctx);
