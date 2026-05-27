@@ -99,6 +99,17 @@ async function initDb() {
       PRIMARY KEY (broadcast_id, telegram_id, message_id)
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS action_tokens (
+      token UUID PRIMARY KEY,
+      payload JSONB NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      expires_at TIMESTAMP NOT NULL
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS action_tokens_expires_at_idx ON action_tokens (expires_at);`);
 }
 
 async function getMediaCache(cacheKey) {
@@ -129,6 +140,46 @@ async function upsertMediaCache({ cacheKey, kind, fileId, storageChatId = null, 
 }
 
 module.exports = { pool, initDb, getMediaCache, upsertMediaCache };
+
+async function putActionToken({ token, payload, expiresAt }) {
+  await pool.query(
+    `INSERT INTO action_tokens (token, payload, expires_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (token)
+     DO UPDATE SET payload = EXCLUDED.payload, expires_at = EXCLUDED.expires_at`,
+    [token, payload, expiresAt]
+  );
+}
+
+async function getActionToken(token) {
+  const res = await pool.query(
+    `SELECT token, payload, expires_at
+     FROM action_tokens
+     WHERE token = $1
+     LIMIT 1`,
+    [token]
+  );
+  const row = res.rows?.[0] || null;
+  if (!row) return null;
+  const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : 0;
+  if (!expiresAt || Date.now() > expiresAt) {
+    try {
+      await pool.query('DELETE FROM action_tokens WHERE token = $1', [token]);
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+  return { token: row.token, payload: row.payload, expiresAt: row.expires_at };
+}
+
+async function deleteExpiredActionTokens() {
+  await pool.query('DELETE FROM action_tokens WHERE expires_at < NOW()');
+}
+
+module.exports.putActionToken = putActionToken;
+module.exports.getActionToken = getActionToken;
+module.exports.deleteExpiredActionTokens = deleteExpiredActionTokens;
 
 async function getSearchCache(queryKey, maxAgeMs) {
   const res = await pool.query(

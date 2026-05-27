@@ -17,7 +17,10 @@ const {
   getSearchCache,
   upsertSearchCache,
   getQueryBest,
-  upsertQueryBest
+  upsertQueryBest,
+  putActionToken,
+  getActionToken,
+  deleteExpiredActionTokens
 } = require('./config/db');
 const {
   downloadAllMedia,
@@ -55,6 +58,8 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .filter(Boolean)
   .map((s) => Number(s))
   .filter((n) => Number.isFinite(n));
+
+const ENABLE_BROADCAST = ['1', 'true', 'yes', 'on'].includes(String(process.env.ENABLE_BROADCAST || '').toLowerCase());
 
 const adminState = new Map(); // telegram_id -> { mode: 'broadcast' }
 
@@ -130,22 +135,44 @@ async function trySendBestMp3ForQuery(ctx, query) {
 // Short-lived in-memory cache for callback actions:
 // token -> { kind: 'video'|'audio'|'identify'|'search'|'recognize', url, fallbackUrl?, createdAt, ... }
 const actionCache = new Map();
-const ACTION_TTL_MS = 10 * 60 * 1000;
+const ACTION_TTL_MS = Number(process.env.ACTION_TTL_MS || 6 * 60 * 60 * 1000);
+
+function persistActionToken(token, payload) {
+  const expiresAt = new Date(Date.now() + ACTION_TTL_MS);
+  putActionToken({ token, payload: { ...payload, createdAt: Date.now() }, expiresAt }).catch((e) => {
+    console.error('persistActionToken failed:', e?.message || e);
+  });
+}
 
 function putAction(payload) {
   const token = crypto.randomUUID();
   actionCache.set(token, { ...payload, createdAt: Date.now() });
+  persistActionToken(token, payload);
   return token;
 }
 
-function getAction(token) {
+async function getAction(token) {
   const entry = actionCache.get(token);
-  if (!entry) return null;
-  if (Date.now() - entry.createdAt > ACTION_TTL_MS) {
-    actionCache.delete(token);
+  if (entry) {
+    if (Date.now() - entry.createdAt > ACTION_TTL_MS) {
+      actionCache.delete(token);
+      return null;
+    }
+    return entry;
+  }
+
+  try {
+    const row = await getActionToken(token);
+    const payload = row?.payload || null;
+    if (!payload) return null;
+    const createdAt = Number(payload.createdAt || 0);
+    if (!createdAt || Date.now() - createdAt > ACTION_TTL_MS) return null;
+    actionCache.set(token, payload);
+    return payload;
+  } catch (e) {
+    console.error('getActionToken failed:', e?.message || e);
     return null;
   }
-  return entry;
 }
 
 function cleanupActions() {
@@ -155,6 +182,9 @@ function cleanupActions() {
   }
 }
 setInterval(cleanupActions, 60_000).unref();
+setInterval(() => {
+  deleteExpiredActionTokens().catch(() => {});
+}, 10 * 60_000).unref();
 
 const LOADER_FRAMES = ['⏳', '⌛️', '⏳', '⌛️'];
 async function startLoader(ctx, baseText) {
@@ -243,21 +273,22 @@ function isAdmin(ctx) {
 }
 
 async function adminPanel(ctx) {
+  const rows = [[Markup.button.callback('📊 Statistika', 'adm:stats')]];
+  if (ENABLE_BROADCAST) {
+    rows.push([Markup.button.callback('📣 Reklama yuborish', 'adm:bcast')]);
+    rows.push([Markup.button.callback('🗑 Oxirgi reklama (o‘chirish)', 'adm:del_last')]);
+  }
   await ctx.reply(
     '🔐 Admin panel',
-    Markup.inlineKeyboard(
-      [
-        [Markup.button.callback('📊 Statistika', 'adm:stats')],
-        [Markup.button.callback('📣 Reklama yuborish', 'adm:bcast')],
-        [Markup.button.callback('🗑 Oxirgi reklama (o‘chirish)', 'adm:del_last')]
-      ],
-      { columns: 1 }
-    )
+    Markup.inlineKeyboard(rows, { columns: 1 })
   );
 }
 
 function adminStaticKeyboard() {
-  return Markup.keyboard([['📊 Statistika', '📣 Reklama'], ['🗑 Oxirgi reklama']])
+  const rows = ENABLE_BROADCAST
+    ? [['📊 Statistika', '📣 Reklama'], ['🗑 Oxirgi reklama']]
+    : [['📊 Statistika']];
+  return Markup.keyboard(rows)
     .resize()
     .oneTime(false);
 }
@@ -532,6 +563,12 @@ bot.action('adm:stats', async (ctx) => {
 
 bot.action('adm:bcast', async (ctx) => {
   if (!isAdmin(ctx)) return;
+  if (!ENABLE_BROADCAST) {
+    try {
+      await ctx.answerCbQuery('O‘chirilgan');
+    } catch {}
+    return;
+  }
   try {
     await ctx.answerCbQuery('OK');
   } catch {}
@@ -540,6 +577,12 @@ bot.action('adm:bcast', async (ctx) => {
 
 bot.action('adm:del_last', async (ctx) => {
   if (!isAdmin(ctx)) return;
+  if (!ENABLE_BROADCAST) {
+    try {
+      await ctx.answerCbQuery('O‘chirilgan');
+    } catch {}
+    return;
+  }
   try {
     await ctx.answerCbQuery('OK');
   } catch {}
@@ -549,8 +592,10 @@ bot.action('adm:del_last', async (ctx) => {
 bot.use(async (ctx, next) => {
   // Admin broadcast mode should accept any message type (text/photo/video/etc) in private chat.
   try {
-    const handled = await handleAdminBroadcastMessage(ctx);
-    if (handled) return;
+    if (ENABLE_BROADCAST) {
+      const handled = await handleAdminBroadcastMessage(ctx);
+      if (handled) return;
+    }
   } catch (e) {
     console.error('broadcast middleware failed:', e?.message || e);
   }
@@ -584,13 +629,15 @@ bot.on('text', async (ctx) => {
       await handleAdminStats(ctx);
       return;
     }
-    if (text === '📣 Reklama') {
-      await handleAdminBroadcastStart(ctx);
-      return;
-    }
-    if (text === '🗑 Oxirgi reklama') {
-      await handleAdminDeleteLastBroadcast(ctx);
-      return;
+    if (ENABLE_BROADCAST) {
+      if (text === '📣 Reklama') {
+        await handleAdminBroadcastStart(ctx);
+        return;
+      }
+      if (text === '🗑 Oxirgi reklama') {
+        await handleAdminDeleteLastBroadcast(ctx);
+        return;
+      }
     }
   }
 
@@ -660,7 +707,7 @@ async function handleMediaLink(ctx, url) {
       });
       buttons.push(Markup.button.callback("🎵 Qo‘shiqni yuklab olish", `rs:${token}`));
     } else if (audioUrl) {
-      const token = putAction({ kind: 'audio', url: audioUrl });
+      const token = putAction({ kind: 'audio', url: audioUrl, originalUrl: url });
       buttons.push(Markup.button.callback('🎵 Audio ⬇️', `dl:a:${token}`));
     }
 
@@ -712,9 +759,12 @@ async function handleMediaLink(ctx, url) {
 
       // Fallback: old behavior from universal downloader response.
       const yt = extractYouTubeOptions(raw);
-      const videoButtons = buildYouTubeVideoButtons(yt.videos || [], videoUrl || null);
+      const videoButtons = buildYouTubeVideoButtons(yt.videos || [], videoUrl || null, url);
       const audioButton = audioUrl
-        ? Markup.button.callback("🎵 Audioni yuklab olish", `dl:a:${putAction({ kind: 'audio', url: audioUrl })}`)
+        ? Markup.button.callback(
+            "🎵 Audioni yuklab olish",
+            `dl:a:${putAction({ kind: 'audio', url: audioUrl, originalUrl: url })}`
+          )
         : null;
       const fallbackVideoId = extractYouTubeId(url);
       const mp3Button = fallbackVideoId
@@ -768,7 +818,7 @@ async function handleMediaLink(ctx, url) {
 
     // Default flow: show choice buttons (YouTube va boshqalar).
     if (videoUrl) {
-      const token = putAction({ kind: 'video', url: videoUrl });
+      const token = putAction({ kind: 'video', url: videoUrl, originalUrl: url });
       buttons.unshift(Markup.button.callback('🎥 Video', `dl:v:${token}`));
     }
     const caption = [title ? `Topildi: ${title}` : 'Nimani yuklab olamiz?', '', BRAND_FOOTER].join('\n');
@@ -1022,7 +1072,7 @@ function sizeToApproxMb(size) {
   return `~${Math.round(mb)}MB`;
 }
 
-function buildYouTubeVideoButtons(videos, fallbackUrl) {
+function buildYouTubeVideoButtons(videos, fallbackUrl, originalUrl) {
   const preferred = [144, 240, 360, 480, 720, 1080];
   const byHeight = new Map();
   for (const v of videos || []) {
@@ -1046,6 +1096,7 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
         `dl:v:${putAction({
           kind: 'video',
           url: v.url,
+          originalUrl: originalUrl || undefined,
           fallbackUrl: fallbackUrl || undefined,
           expectedHeight: h
         })}`
@@ -1066,6 +1117,7 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
           `dl:v:${putAction({
             kind: 'video',
             url: v.url,
+            originalUrl: originalUrl || undefined,
             fallbackUrl: fallbackUrl || undefined,
             expectedHeight: v.height || undefined
           })}`
@@ -1079,7 +1131,7 @@ function buildYouTubeVideoButtons(videos, fallbackUrl) {
     out.push(
       Markup.button.callback(
         '🎬 Video ⬇️',
-        `dl:v:${putAction({ kind: 'video', url: fallbackUrl })}`
+        `dl:v:${putAction({ kind: 'video', url: fallbackUrl, originalUrl: originalUrl || undefined })}`
       )
     );
   }
@@ -1152,7 +1204,7 @@ function buildSearchKeyboard(token, countOnPage, hasNext) {
 }
 
 async function sendSearchPage(ctx, token) {
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'search') {
     await ctx.reply("Qidiruv muddati o‘tgan. Qaytadan so‘rov yuboring.");
     return;
@@ -1178,7 +1230,7 @@ async function sendSearchPage(ctx, token) {
 bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
   const type = ctx.match?.[1];
   const token = ctx.match?.[2];
-  const entry = getAction(token);
+  const entry = await getAction(token);
 
   if (!entry) {
     try {
@@ -1204,23 +1256,42 @@ bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
   }
 
   try {
+    let url = entry.url;
+    let fallbackUrl = entry.fallbackUrl;
+    let expectedHeight = entry.expectedHeight;
+
+    const createdAt = Number(entry.createdAt || 0);
+    const isOld = createdAt && Date.now() - createdAt > 60_000;
+    if (entry.originalUrl && isOld) {
+      try {
+        const refreshed = await downloadAllMedia(entry.originalUrl);
+        if (type === 'v') {
+          url = refreshed.videoUrl || url;
+        } else {
+          url = refreshed.audioUrl || url;
+        }
+      } catch (e) {
+        console.error('refresh download link failed:', e?.response?.data || e?.message || e);
+      }
+    }
+
     if (type === 'v') {
       const ok = await withTimeout(
         sendTelegramMedia(
           ctx,
           'video',
-          entry.url,
+          url,
           BRAND_FOOTER,
-          entry.fallbackUrl,
-          entry.expectedHeight,
-          makeUrlCacheKey('video', entry.url)
+          fallbackUrl,
+          expectedHeight,
+          makeUrlCacheKey('video', url)
         ),
         120_000
       );
       if (!ok) throw new Error('VIDEO_SEND_FAILED');
     } else {
       const ok = await withTimeout(
-        sendTelegramMedia(ctx, 'audio', entry.url, BRAND_FOOTER, entry.fallbackUrl, undefined, makeUrlCacheKey('audio', entry.url)),
+        sendTelegramMedia(ctx, 'audio', url, BRAND_FOOTER, fallbackUrl, undefined, makeUrlCacheKey('audio', url)),
         120_000
       );
       if (!ok) throw new Error('AUDIO_SEND_FAILED');
@@ -1243,7 +1314,7 @@ bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
 
 bot.action(/^id:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry) {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
@@ -1292,7 +1363,7 @@ bot.action(/^id:(.+)$/, async (ctx) => {
 
 bot.action(/^rs:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'recognize') {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
@@ -1398,7 +1469,7 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
 bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
   const token = ctx.match?.[1];
   const index = Number(ctx.match?.[2]) - 1;
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'search') {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Qidiruvni qayta yuboring.");
@@ -1443,7 +1514,7 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
 
 bot.action(/^sn:([^:]+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'search') {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan.");
@@ -1466,7 +1537,7 @@ bot.action(/^sn:([^:]+)$/, async (ctx) => {
 
 bot.action(/^ya:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'ytaudio' || !entry.id) {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
@@ -1494,7 +1565,7 @@ bot.action(/^ya:(.+)$/, async (ctx) => {
 
 bot.action(/^yv:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'ytvideo' || !entry.id || !entry.quality) {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
@@ -1542,7 +1613,7 @@ bot.action(/^yv:(.+)$/, async (ctx) => {
 
 bot.action(/^ya2:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'ytaudio2' || !entry.id || !entry.quality) {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
@@ -1579,7 +1650,7 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
 
 bot.action(/^ym:(.+)$/, async (ctx) => {
   const token = ctx.match?.[1];
-  const entry = getAction(token);
+  const entry = await getAction(token);
   if (!entry || entry.kind !== 'ytmp3' || !entry.id) {
     try {
       await ctx.answerCbQuery("Bu tugma muddati o‘tgan. Havolani qaytadan yuboring.");
@@ -1636,6 +1707,19 @@ async function waitUntilReady(urls, maxWaitMs) {
 }
 
 async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight, cacheKeyOverride) {
+  try {
+    const u = new URL(String(url || ''));
+    const host = (u.hostname || '').toLowerCase();
+    if (host === 't.me' || host === 'telegram.me') {
+      await ctx.reply(
+        "Downloader xizmatidan noto‘g‘ri (reklama) havola qaytdi. Iltimos, keyinroq urinib ko‘ring yoki admin RapidAPI downloader hostini almashtirsin."
+      );
+      return false;
+    }
+  } catch {
+    // ignore URL parse errors
+  }
+
   const cacheKey =
     cacheKeyOverride ||
     (() => {
