@@ -38,6 +38,8 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 const BRAND_FOOTER = '🤖 @Navobot_bot birinchi raqamli yuklovchi bot';
 const MAX_TELEGRAM_UPLOAD_BYTES = Number(process.env.MAX_TELEGRAM_UPLOAD_BYTES || 49 * 1024 * 1024);
 const STORAGE_CHAT_ID = process.env.STORAGE_CHAT_ID || process.env.STORAGE_CHANNEL_ID || null;
+let BOT_USERNAME = process.env.BOT_USERNAME || null;
+let BOT_ID = process.env.BOT_ID ? Number(process.env.BOT_ID) : null;
 
 function sha1(text) {
   return crypto.createHash('sha1').update(String(text || ''), 'utf8').digest('hex');
@@ -103,6 +105,27 @@ function isSupportedUrl(text) {
   return Boolean(normalizeUrl(text));
 }
 
+function isGroupChat(ctx) {
+  const t = ctx.chat?.type;
+  return t === 'group' || t === 'supergroup';
+}
+
+function isReplyToBot(ctx) {
+  const from = ctx.message?.reply_to_message?.from;
+  if (!from) return false;
+  if (BOT_ID && from.id === BOT_ID) return true;
+  if (BOT_USERNAME && from.username && String(from.username).toLowerCase() === String(BOT_USERNAME).toLowerCase()) {
+    return true;
+  }
+  return false;
+}
+
+function mentionsBot(text) {
+  if (!BOT_USERNAME) return false;
+  const t = String(text || '');
+  return new RegExp(`\\B@${BOT_USERNAME}\\b`, 'i').test(t);
+}
+
 bot.start(async (ctx) => {
   try {
     const telegramId = ctx.from?.id;
@@ -141,21 +164,15 @@ bot.catch((err, ctx) => {
   console.error(`Telegraf error (${updateType}):`, err?.response?.description || err?.message || err);
 });
 
-bot.on('text', async (ctx) => {
-  const text = (ctx.message?.text || '').trim();
-  if (!text) return;
-
-  if (isSupportedUrl(text)) {
-    await handleMediaLink(ctx, normalizeUrl(text));
-    return;
-  }
-
-  await handleMusicSearch(ctx, text);
-});
-
 bot.command('storageid', async (ctx) => {
   await ctx.reply(
-    "Storage kanal ID sini olish uchun shu kanaldan istalgan postni botga FORWARD qiling. Men sizga `STORAGE_CHAT_ID` ni chiqarib beraman."
+    [
+      "Storage kanal ID sini olishning 2 ta yo‘li bor:",
+      "1) Kanaldan istalgan postni botga FORWARD qiling (kanalda 'Protect content' yoqilmagan bo‘lishi kerak).",
+      "2) Botni kanalda admin qiling va kanalda 'test' post yozing — bot logida kanal ID chiqadi.",
+      "",
+      "Keyin `.env` ga qo‘shasiz: STORAGE_CHAT_ID=-100..."
+    ].join('\n')
   );
 });
 
@@ -171,14 +188,64 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+bot.on('channel_post', async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const title = ctx.chat?.title;
+  if (chatId) {
+    console.log('CHANNEL_POST chat.id:', chatId, 'title:', title || null);
+  }
+});
+
+bot.on('text', async (ctx) => {
+  const text = (ctx.message?.text || '').trim();
+  if (!text) return;
+
+  // In groups, avoid responding to every message:
+  // - Always allow supported URLs
+  // - Allow commands (/start, /help, etc.)
+  // - Allow when user replies to the bot
+  // - Allow when bot is mentioned (@BotName)
+  if (isGroupChat(ctx)) {
+    const isCommand = text.startsWith('/');
+    if (!isSupportedUrl(text) && !isCommand && !isReplyToBot(ctx) && !mentionsBot(text)) {
+      return;
+    }
+  }
+
+  if (isSupportedUrl(text)) {
+    await handleMediaLink(ctx, normalizeUrl(text));
+    return;
+  }
+
+  await handleMusicSearch(ctx, text);
+});
+
 async function handleMediaLink(ctx, url) {
   try {
-    await ctx.reply('Yuklab olish havolalarini topyapman…');
-    const { videoUrl, audioUrl, title, raw } = await downloadAllMedia(url);
-
     const host = new URL(url).hostname.toLowerCase();
     const isShort = host.includes('instagram.com') || host.includes('tiktok.com');
     const isYouTube = host.includes('youtube.com') || host.includes('youtu.be');
+
+    // If this exact link was already processed, serve from cache in groups/private chats without hitting APIs.
+    if (isShort) {
+      const linkKey = makeUrlCacheKey('video', url);
+      try {
+        const cached = await getMediaCache(linkKey);
+        if (cached?.file_id) {
+          const token = putAction({ kind: 'recognize', audioUrl: null, videoUrl: url });
+          await ctx.replyWithVideo(cached.file_id, {
+            caption: BRAND_FOOTER,
+            ...Markup.inlineKeyboard([Markup.button.callback("🎵 Qo‘shiqni yuklab olish", `rs:${token}`)], { columns: 1 })
+          });
+          return;
+        }
+      } catch (e) {
+        console.error('short-link cache read failed:', e?.message || e);
+      }
+    }
+
+    await ctx.reply('Yuklab olish havolalarini topyapman…');
+    const { videoUrl, audioUrl, title, raw } = await downloadAllMedia(url);
 
     const buttons = [];
 
@@ -258,10 +325,26 @@ async function handleMediaLink(ctx, url) {
 
     if (isShort && videoUrl) {
       const caption = BRAND_FOOTER;
-      await ctx.replyWithVideo(videoUrl, {
+      const sent = await ctx.replyWithVideo(videoUrl, {
         caption,
         ...Markup.inlineKeyboard(buttons, { columns: 2 })
       });
+      try {
+        // Cache both by the original link and by the resolved CDN URL.
+        const stored = await maybeCacheAndStore(ctx, 'video', makeUrlCacheKey('video', url), sent);
+        if (stored?.fileId) {
+          await upsertMediaCache({
+            cacheKey: makeUrlCacheKey('video', videoUrl),
+            kind: 'video',
+            fileId: stored.fileId,
+            storageChatId: stored.storageChatId,
+            storageMessageId: stored.storageMessageId,
+            meta: null
+          });
+        }
+      } catch (e) {
+        console.error('store short video failed:', e?.message || e);
+      }
       return;
     }
 
@@ -610,11 +693,16 @@ async function handleMusicSearch(ctx, query) {
   } catch (err) {
     console.error('handleMusicSearch error:', err?.response?.data || err?.message || err);
     const status = err?.response?.status;
+    const msg = String(err?.response?.data?.message || err?.message || '').toLowerCase();
     if (status === 429) {
       await ctx.reply("YouTube API limiti tugadi (429). Keyinroq qayta urinib ko‘ring.");
       return;
     }
     if (status === 403) {
+      if (msg.includes('exceeded') && msg.includes('quota')) {
+        await ctx.reply("YouTube API oylik limit tugagan. RapidAPI planingizni yangilang yoki limit yangilanishini kuting.");
+        return;
+      }
       await ctx.reply("YouTube API ruxsat bermadi (403). RapidAPI obuna/host sozlamalarini tekshiring.");
       return;
     }
@@ -826,6 +914,10 @@ bot.action(/^rs:(.+)$/, async (ctx) => {
     await sendSearchPage(ctx, searchToken);
   } catch (err) {
     console.error('recognize->search error:', err?.response?.data || err?.message || err);
+    if (err?.code === 'ECONNABORTED' || String(err?.message || '').toLowerCase().includes('timeout')) {
+      await ctx.reply("Qo‘shiqni aniqlash sekinlashdi (timeout). 1-2 daqiqadan keyin yana urinib ko‘ring.");
+      return;
+    }
     await ctx.reply("Kechirasiz, videodagi qo‘shiqni aniqlab bo‘lmadi. Keyinroq urinib ko‘ring.");
   }
 });
@@ -1181,10 +1273,13 @@ async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage) {
 
   let storageMessageId = null;
   const storageChatId = STORAGE_CHAT_ID ? String(STORAGE_CHAT_ID) : null;
-  if (storageChatId) {
+  if (!storageChatId) {
+    console.warn('STORAGE_CHAT_ID is not set; skipping storage copy');
+  } else {
     try {
       const copied = await ctx.telegram.copyMessage(storageChatId, ctx.chat.id, sentMessage.message_id);
       storageMessageId = copied?.message_id || null;
+      console.log('stored to channel:', { storageChatId, storageMessageId, kind, cacheKey });
     } catch (e) {
       console.error('copy to storage failed:', e?.response?.description || e?.message || e);
     }
@@ -1202,6 +1297,8 @@ async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage) {
   } catch (e) {
     console.error('cache upsert failed:', e?.message || e);
   }
+
+  return { fileId, storageChatId: storageChatId || null, storageMessageId };
 }
 
 function withTimeout(promise, ms) {
@@ -1215,12 +1312,21 @@ function withTimeout(promise, ms) {
 async function start() {
   await initDb();
   console.log('DB connected and users table is ready');
+  console.log('Storage configured:', { STORAGE_CHAT_ID: STORAGE_CHAT_ID || null });
 
   app.listen(PORT, () => {
     console.log(`Express server listening on port ${PORT}`);
   });
 
   await bot.launch();
+  try {
+    const me = await bot.telegram.getMe();
+    BOT_USERNAME = me?.username || BOT_USERNAME;
+    BOT_ID = me?.id || BOT_ID;
+    console.log('Bot identity:', { username: BOT_USERNAME || null, id: BOT_ID || null });
+  } catch (e) {
+    console.warn('Failed to get bot identity:', e?.message || e);
+  }
   console.log('Telegraf bot started (polling)');
 
   process.once('SIGINT', () => bot.stop('SIGINT'));

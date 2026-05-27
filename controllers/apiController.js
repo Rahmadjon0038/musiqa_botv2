@@ -44,7 +44,11 @@ const ytVideoClient = createRapidClient(
   process.env.YT_VIDEO_API_HOST,
   Number(process.env.YT_VIDEO_TIMEOUT_MS || 60_000)
 );
-const shazamClient = createRapidClient(process.env.SHAZAM_API_BASEURL, process.env.SHAZAM_API_HOST);
+const shazamClient = createRapidClient(
+  process.env.SHAZAM_API_BASEURL,
+  process.env.SHAZAM_API_HOST,
+  Number(process.env.SHAZAM_TIMEOUT_MS || 60_000)
+);
 
 function pickFirstUrl(value) {
   if (!value) return null;
