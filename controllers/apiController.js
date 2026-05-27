@@ -563,8 +563,12 @@ async function recognizeSongFromAudioUrl(audioUrl) {
 
       const form = new URLSearchParams();
       if (mode === 'base64') {
-        const audioBase64 = await fetchAudioSampleBase64(audioUrl);
-        form.set(fileField, audioBase64);
+        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl);
+        let uploadBuf = buf;
+        if (srcType.includes('video/')) {
+          uploadBuf = await convertToMp3(buf, 'mp4');
+        }
+        form.set(fileField, uploadBuf.toString('base64'));
       } else {
         // Many RapidAPI "Shazam Core" recognize endpoints accept a direct URL in "file".
         form.set(fileField, audioUrl);
