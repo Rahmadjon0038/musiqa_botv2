@@ -228,6 +228,12 @@ async function adminPanel(ctx) {
   );
 }
 
+function adminStaticKeyboard() {
+  return Markup.keyboard([['📊 Statistika', '📣 Reklama'], ['❌ Admin menyuni yopish']])
+    .resize()
+    .oneTime(false);
+}
+
 bot.start(async (ctx) => {
   try {
     const telegramId = ctx.from?.id;
@@ -246,6 +252,21 @@ bot.start(async (ctx) => {
     }
   } catch (err) {
     console.error('DB insert on /start failed:', err?.message || err);
+  }
+
+  const welcomeText = [
+    'Salom men Navobotman!',
+    '',
+    '✅ Mening xususiyatlarim bilan tanishing:',
+    '',
+    ' • Qo‘shiq matni, nomi yoki ijrochi ismi orqali musiqa topaman',
+    '',
+    ' • Instagram, Youtube va Tik-Tokdan video va undagi musiqani yuklab beraman'
+  ].join('\n');
+
+  if (ctx.chat?.type === 'private' && isAdmin(ctx)) {
+    await ctx.reply(welcomeText, adminStaticKeyboard());
+    return;
   }
 
   await ctx.reply(
@@ -304,7 +325,11 @@ bot.command('whois', async (ctx) => {
 });
 
 bot.command('admin', async (ctx) => {
-  if (!isAdmin(ctx)) return;
+  console.log('admin command:', { from: ctx.from?.id || null, isAdmin: isAdmin(ctx) });
+  if (!isAdmin(ctx)) {
+    await ctx.reply('Bu buyruq faqat adminlar uchun.');
+    return;
+  }
   await adminPanel(ctx);
 });
 
@@ -364,6 +389,39 @@ bot.on('channel_post', async (ctx) => {
 bot.on('text', async (ctx) => {
   const text = (ctx.message?.text || '').trim();
   if (!text) return;
+
+  // Admin static menu (private only)
+  if (ctx.chat?.type === 'private' && isAdmin(ctx)) {
+    if (text === '📊 Statistika') {
+      // Reuse the same handler as inline buttons
+      await bot.handleUpdate({
+        callback_query: {
+          id: String(Date.now()),
+          from: ctx.from,
+          message: ctx.message,
+          chat_instance: '0',
+          data: 'adm:stats'
+        }
+      });
+      return;
+    }
+    if (text === '📣 Reklama') {
+      await bot.handleUpdate({
+        callback_query: {
+          id: String(Date.now()),
+          from: ctx.from,
+          message: ctx.message,
+          chat_instance: '0',
+          data: 'adm:bcast'
+        }
+      });
+      return;
+    }
+    if (text === '❌ Admin menyuni yopish') {
+      await ctx.reply('Admin menyu yopildi.', Markup.removeKeyboard());
+      return;
+    }
+  }
 
   // Admin broadcast mode (private chats only).
   if (ctx.chat?.type === 'private' && isAdmin(ctx)) {
