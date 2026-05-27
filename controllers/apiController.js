@@ -4,6 +4,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs/promises');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 
 function createRapidClient(baseURL, host, timeoutMs = 30_000) {
   return axios.create({
@@ -44,11 +45,18 @@ const ytVideoClient = createRapidClient(
   process.env.YT_VIDEO_API_HOST,
   Number(process.env.YT_VIDEO_TIMEOUT_MS || 60_000)
 );
-const shazamClient = createRapidClient(
-  process.env.SHAZAM_API_BASEURL,
-  process.env.SHAZAM_API_HOST,
-  Number(process.env.SHAZAM_TIMEOUT_MS || 60_000)
-);
+
+function requireAcrCloudConfig() {
+  const host = process.env.ACRCLOUD_HOST;
+  const accessKey = process.env.ACRCLOUD_ACCESS_KEY;
+  const accessSecret = process.env.ACRCLOUD_ACCESS_SECRET;
+  if (!host || !accessKey || !accessSecret) {
+    const err = new Error('ACRCloud config is not set');
+    err.code = 'CONFIG';
+    throw err;
+  }
+  return { host, accessKey, accessSecret };
+}
 
 function pickFirstUrl(value) {
   if (!value) return null;
@@ -319,31 +327,9 @@ function isAudioOnlyError(err) {
   return msg.includes('only .wav') || msg.includes('only .ogg') || msg.includes('only .mp3');
 }
 
-function isBadFileContentError(err) {
-  const data = err?.response?.data;
-  const msg = JSON.stringify(data || err?.message || '').toLowerCase();
-  return msg.includes('bad file content') || msg.includes('failed to recognize');
-}
-
-function shazamDebugEnabled() {
-  const v = String(process.env.DEBUG_SHAZAM || '').toLowerCase();
+function acrDebugEnabled() {
+  const v = String(process.env.DEBUG_ACRCLOUD || '').toLowerCase();
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
-}
-
-async function fetchAudioSampleBase64(audioUrl, maxBytes = 2_000_000) {
-  // Avoid downloading the full file. Many servers support Range; if not, we still cap by truncating locally.
-  const res = await axios.get(audioUrl, {
-    responseType: 'arraybuffer',
-    timeout: 30_000,
-    headers: { Range: `bytes=0-${maxBytes - 1}` },
-    maxContentLength: maxBytes + 1024 * 64,
-    maxBodyLength: maxBytes + 1024 * 64,
-    validateStatus: (s) => (s >= 200 && s < 300) || s === 206
-  });
-
-  const buf = Buffer.from(res.data);
-  const sliced = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
-  return sliced.toString('base64');
 }
 
 async function fetchSampleBuffer(url, maxBytes = 2_000_000) {
@@ -358,6 +344,16 @@ async function fetchSampleBuffer(url, maxBytes = 2_000_000) {
   const buf = Buffer.from(res.data);
   const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
   return { buf: buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf, contentType, status: res.status };
+}
+
+function extFromContentType(contentType) {
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('video/mp4')) return 'mp4';
+  if (ct.includes('audio/mpeg') || ct.includes('audio/mp3')) return 'mp3';
+  if (ct.includes('audio/mp4') || ct.includes('audio/x-m4a') || ct.includes('audio/m4a')) return 'm4a';
+  if (ct.includes('audio/ogg')) return 'ogg';
+  if (ct.includes('audio/wav') || ct.includes('audio/x-wav')) return 'wav';
+  return 'bin';
 }
 
 async function convertToMp3(inputBuf, inputExtHint = 'mp4', opts = {}) {
@@ -404,6 +400,86 @@ async function convertToMp3(inputBuf, inputExtHint = 'mp4', opts = {}) {
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+}
+
+async function buildRecognitionSampleMp3FromUrl(sourceUrl) {
+  const sampleBytes = Number(process.env.RECOGNITION_SAMPLE_BYTES || 2_000_000);
+  const seconds = Number(process.env.RECOGNITION_SAMPLE_SECONDS || 8);
+  const { buf, contentType, status } = await fetchSampleBuffer(sourceUrl, sampleBytes);
+  const dbg = acrDebugEnabled();
+  if (dbg) console.log('[acr] fetched', { status, contentType, bytes: buf.length, sampleBytes, seconds });
+
+  if (String(contentType).includes('text/html')) {
+    const err = new Error('NOT_MEDIA');
+    err.code = 'NOT_MEDIA';
+    err.details = { status, contentType };
+    throw err;
+  }
+
+  const extHint = extFromContentType(contentType);
+  const out = await convertToMp3(buf, extHint, { seconds, bitrate: '96k', sampleRate: 16000, channels: 1 });
+  if (dbg) console.log('[acr] sample ready', { bytes: out.length });
+  return out;
+}
+
+async function recognizeSongWithAcrCloudFromUrl(sourceUrl) {
+  const { host, accessKey, accessSecret } = requireAcrCloudConfig();
+  const dbg = acrDebugEnabled();
+  const endpointPath = process.env.ACRCLOUD_PATH || '/v1/identify';
+  const url = /^https?:\/\//i.test(host) ? `${host}${endpointPath}` : `https://${host}${endpointPath}`;
+
+  const sample = await buildRecognitionSampleMp3FromUrl(sourceUrl);
+  const dataType = 'audio';
+  const signatureVersion = '1';
+  const timestamp = Math.floor(Date.now() / 1000);
+  const stringToSign = ['POST', endpointPath, accessKey, dataType, signatureVersion, String(timestamp)].join('\n');
+  const signature = crypto.createHmac('sha1', accessSecret).update(stringToSign, 'utf8').digest('base64');
+
+  const fd = new FormData();
+  fd.append('sample', sample, { filename: 'sample.mp3', contentType: 'audio/mpeg' });
+  fd.append('sample_bytes', String(sample.length));
+  fd.append('access_key', accessKey);
+  fd.append('data_type', dataType);
+  fd.append('signature_version', signatureVersion);
+  fd.append('signature', signature);
+  fd.append('timestamp', String(timestamp));
+
+  if (dbg) console.log('[acr] request', { url, endpointPath, sampleBytes: sample.length });
+
+  const res = await axios.post(url, fd, {
+    headers: fd.getHeaders(),
+    timeout: Number(process.env.ACRCLOUD_TIMEOUT_MS || 60_000),
+    validateStatus: () => true
+  });
+
+  if (dbg) console.log('[acr] response', { httpStatus: res.status, status: res.data?.status || null });
+
+  if (res.status >= 400) {
+    const err = new Error('ACRCloud HTTP error');
+    err.details = res.data;
+    throw err;
+  }
+
+  const code = res.data?.status?.code;
+  if (code !== 0) {
+    const err = new Error('Recognition API could not identify the track');
+    err.code = 'NO_MATCH';
+    err.details = res.data?.status || res.data;
+    throw err;
+  }
+
+  const music = res.data?.metadata?.music?.[0] || null;
+  const title = music?.title || null;
+  const artist = (music?.artists || []).map((a) => a?.name).filter(Boolean).join(', ') || null;
+
+  if (!title && !artist) {
+    const err = new Error('Recognition API could not identify the track');
+    err.code = 'NO_MATCH';
+    err.details = res.data;
+    throw err;
+  }
+
+  return { title, artist, raw: res.data };
 }
 
 function pickQualities(data) {
@@ -566,153 +642,8 @@ async function downloadYouTubeAudioByQuality(videoId, quality) {
 }
 
 async function recognizeSongFromAudioUrl(audioUrl) {
-  requireRapidApiKey();
-  requireBase(process.env.SHAZAM_API_BASEURL, 'SHAZAM_API_BASEURL');
-
-  try {
-    const detectPath = process.env.SHAZAM_DETECT_PATH || '/songs/v2/detect';
-    const contentType = process.env.SHAZAM_CONTENT_TYPE || 'application/json';
-    const dbg = shazamDebugEnabled();
-    if (dbg) console.log('[shazam] start', { detectPath, contentType, audioUrl });
-
-    let res;
-    if (contentType.includes('multipart/form-data')) {
-      const fileField = process.env.SHAZAM_FILE_FIELD || 'file';
-      const sampleBytes = Number(process.env.SHAZAM_SAMPLE_BYTES || 2_000_000);
-
-      const { buf, contentType: srcType, status } = await fetchSampleBuffer(audioUrl, sampleBytes);
-      if (dbg) console.log('[shazam] fetched', { status, srcType, bytes: buf.length, sampleBytes });
-      let uploadBuf = buf;
-      if (srcType.includes('video/')) {
-        if (dbg) console.log('[shazam] transcode video->mp3');
-        uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
-      } else if (srcType.includes('audio/') && !srcType.includes('mpeg')) {
-        // Normalize odd audio formats to mp3 to match API requirements.
-        if (dbg) console.log('[shazam] transcode audio->mp3', { srcType });
-        uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
-      }
-      if (dbg) console.log('[shazam] upload prep', { uploadBytes: uploadBuf.length });
-
-      const fd = new FormData();
-      fd.append(fileField, uploadBuf, { filename: 'sample.mp3', contentType: 'audio/mpeg' });
-      res = await shazamClient.post(detectPath, fd, { headers: fd.getHeaders() });
-    } else if (contentType.includes('application/x-www-form-urlencoded')) {
-      const fileField = process.env.SHAZAM_FILE_FIELD || 'file';
-      const mode = (process.env.SHAZAM_FILE_MODE || 'url').toLowerCase();
-      const sampleBytes = Number(process.env.SHAZAM_SAMPLE_BYTES || 8_000_000);
-
-      const form = new URLSearchParams();
-      if (mode === 'base64') {
-        const { buf, contentType: srcType, status } = await fetchSampleBuffer(audioUrl, sampleBytes);
-        if (dbg) console.log('[shazam] fetched', { status, srcType, bytes: buf.length, sampleBytes });
-        let uploadBuf = buf;
-        let filename = 'sample.mp3';
-        let uploadType = 'audio/mpeg';
-        if (srcType.includes('video/')) {
-          if (dbg) console.log('[shazam] transcode video->mp3');
-          uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
-        }
-        if (dbg) console.log('[shazam] upload prep', { uploadBytes: uploadBuf.length, mode });
-
-        // Some providers accept base64 in form field, some require multipart.
-        // Try base64 first; on "Bad file content", fall back to multipart upload below.
-        form.set(fileField, uploadBuf.toString('base64'));
-
-        try {
-          res = await shazamClient.post(detectPath, form.toString(), {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-          });
-        } catch (err) {
-          if (dbg) console.log('[shazam] urlencoded failed', err?.response?.data || err?.message || err);
-          if (!isBadFileContentError(err) && !isUploadFileExpectedError(err) && !isAudioOnlyError(err)) throw err;
-
-          const fd = new FormData();
-          fd.append(fileField, uploadBuf, { filename, contentType: uploadType });
-          res = await shazamClient.post(detectPath, fd, { headers: fd.getHeaders() });
-        }
-        // base64 branch handled fully
-        // eslint-disable-next-line no-lone-blocks
-        {
-          const track = res.data?.track || res.data?.data?.track || res.data?.result?.track || null;
-          const title = track?.title || null;
-          const artist = track?.subtitle || track?.artist || null;
-
-          if (!title && !artist) {
-            const e = new Error('Recognition API could not identify the track');
-            e.code = 'NO_MATCH';
-            throw e;
-          }
-
-          return { title, artist, raw: res.data };
-        }
-      } else {
-        // Many RapidAPI "Shazam Core" recognize endpoints accept a direct URL in "file".
-        if (dbg) console.log('[shazam] using url mode');
-        form.set(fileField, audioUrl);
-      }
-
-      try {
-        res = await shazamClient.post(detectPath, form.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
-      } catch (err) {
-        if (dbg) console.log('[shazam] urlencoded failed', err?.response?.data || err?.message || err);
-        // Some Shazam APIs require a multipart file upload, not a URL string.
-        if (!isUploadFileExpectedError(err) && !isAudioOnlyError(err) && !isBadFileContentError(err)) throw err;
-
-        const { buf, contentType: srcType } = await fetchSampleBuffer(audioUrl, sampleBytes);
-        let uploadBuf = buf;
-        let filename = 'sample.mp3';
-        let uploadType = 'audio/mpeg';
-
-        // If provider only accepts audio and we have video, transcode a short sample to mp3.
-        if (srcType.includes('video/') || isAudioOnlyError(err)) {
-          if (dbg) console.log('[shazam] transcode video/audio->mp3 after error', { srcType });
-          uploadBuf = await convertToMp3(buf, 'mp4', { seconds: 4, bitrate: '96k', sampleRate: 16000, channels: 1 });
-          filename = 'sample.mp3';
-          uploadType = 'audio/mpeg';
-        }
-
-        const fd = new FormData();
-        fd.append(fileField, uploadBuf, {
-          filename,
-          contentType: uploadType
-        });
-
-        res = await shazamClient.post(detectPath, fd, {
-          headers: fd.getHeaders()
-        });
-      }
-    } else {
-      const audioField = process.env.SHAZAM_AUDIO_FIELD || 'audio';
-      const audioBase64 = await fetchAudioSampleBase64(audioUrl);
-      res = await shazamClient.post(
-        detectPath,
-        { [audioField]: audioBase64 },
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-
-    if (dbg) console.log('[shazam] response keys', Object.keys(res.data || {}));
-    const track = res.data?.track || res.data?.data?.track || res.data?.result?.track || null;
-    const title = track?.title || null;
-    const artist = track?.subtitle || track?.artist || null;
-
-    if (!title && !artist) {
-      const err = new Error('Recognition API could not identify the track');
-      err.code = 'NO_MATCH';
-      throw err;
-    }
-
-    return { title, artist, raw: res.data };
-  } catch (err) {
-    if (isRateLimitOrForbidden(err)) {
-      const e = new Error('Recognition API quota/forbidden');
-      e.code = 'RAPIDAPI_LIMIT';
-      throw e;
-    }
-    throw err;
-  }
+  // Switched from RapidAPI Shazam Core to ACRCloud.
+  return await recognizeSongWithAcrCloudFromUrl(audioUrl);
 }
 
 module.exports = {

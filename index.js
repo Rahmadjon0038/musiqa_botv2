@@ -903,7 +903,7 @@ bot.action(/^id:(.+)$/, async (ctx) => {
     }
     if (err?.code === 'CONFIG') {
       await ctx.reply(
-        "Server sozlamalari yetishmayapti. `.env` da `RAPIDAPI_KEY`, `SHAZAM_API_BASEURL`, `SHAZAM_API_HOST` ni to‘ldirib, keyin qayta ishga tushiring."
+        "Server sozlamalari yetishmayapti. `.env` da `ACRCLOUD_HOST`, `ACRCLOUD_ACCESS_KEY`, `ACRCLOUD_ACCESS_SECRET` ni to‘ldirib, keyin qayta ishga tushiring."
       );
       return;
     }
