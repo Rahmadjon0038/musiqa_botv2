@@ -1959,6 +1959,14 @@ async function start() {
     console.log(`Express server listening on port ${PORT}`);
   });
 
+  // Safety: if someone set a webhook on this token, remove it so polling works reliably
+  // and to reduce the chance of a rogue webhook receiving updates.
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+  } catch (e) {
+    console.warn('Failed to delete webhook:', e?.message || e);
+  }
+
   await bot.launch();
   try {
     const me = await bot.telegram.getMe();
