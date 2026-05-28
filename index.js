@@ -63,6 +63,11 @@ const ENABLE_BROADCAST = ['1', 'true', 'yes', 'on'].includes(String(process.env.
 
 const adminState = new Map(); // telegram_id -> { mode: 'broadcast' }
 
+function isCancelBroadcastText(text) {
+  const t = String(text || '').trim().toLowerCase();
+  return t === '/cancel' || t === 'cancel' || t === 'bekor' || t === 'bekor qilish' || t === '❌ bekor qilish';
+}
+
 function sha1(text) {
   return crypto.createHash('sha1').update(String(text || ''), 'utf8').digest('hex');
 }
@@ -299,6 +304,10 @@ function adminStaticKeyboard() {
     .oneTime(false);
 }
 
+function adminBroadcastCancelKeyboard() {
+  return Markup.keyboard([['❌ Bekor qilish']]).resize().oneTime(false);
+}
+
 async function handleAdminStats(ctx) {
   try {
     const users = await pool.query('SELECT COUNT(*)::bigint AS n FROM users');
@@ -326,7 +335,19 @@ async function handleAdminStats(ctx) {
 
 async function handleAdminBroadcastStart(ctx) {
   adminState.set(ctx.from.id, { mode: 'broadcast' });
-  await ctx.reply('Reklama matnini yuboring (keyingi xabaringiz hamma foydalanuvchilarga ketadi).');
+  await ctx.reply(
+    "Reklama matnini yuboring (keyingi xabaringiz hamma foydalanuvchilarga ketadi).\n\nBekor qilish uchun: /cancel yoki \"❌ Bekor qilish\" ni bosing.",
+    adminBroadcastCancelKeyboard()
+  );
+}
+
+async function handleAdminBroadcastCancel(ctx) {
+  if (ctx.chat?.type !== 'private' || !isAdmin(ctx)) return false;
+  const st = adminState.get(ctx.from?.id);
+  if (!st?.mode) return false;
+  adminState.delete(ctx.from.id);
+  await ctx.reply('Bekor qilindi.', adminStaticKeyboard());
+  return true;
 }
 
 async function handleAdminDeleteLastBroadcast(ctx) {
@@ -599,6 +620,11 @@ bot.use(async (ctx, next) => {
   // Admin broadcast mode should accept any message type (text/photo/video/etc) in private chat.
   try {
     if (ENABLE_BROADCAST) {
+      const text = ctx.message?.text;
+      if (isCancelBroadcastText(text)) {
+        const cancelled = await handleAdminBroadcastCancel(ctx);
+        if (cancelled) return;
+      }
       const handled = await handleAdminBroadcastMessage(ctx);
       if (handled) return;
     }
