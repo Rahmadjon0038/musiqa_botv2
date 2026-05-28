@@ -72,6 +72,24 @@ function sha1(text) {
   return crypto.createHash('sha1').update(String(text || ''), 'utf8').digest('hex');
 }
 
+function buildStorageCaption(kind, meta) {
+  const m = meta && typeof meta === 'object' ? meta : null;
+  const title = (m?.title || '').toString().trim() || null;
+  const originalUrl = (m?.originalUrl || '').toString().trim() || null;
+  const header = title
+    ? `🎬 ${title}`
+    : kind === 'audio'
+      ? '🎵 Audio'
+      : kind === 'video'
+        ? '🎥 Video'
+        : '📦 Media';
+
+  // Keep it simple and Telegram-friendly (caption limit is ~1024 chars for most media types).
+  let text = [header, originalUrl, '', BRAND_FOOTER].filter(Boolean).join('\n');
+  if (text.length > 1024) text = text.slice(0, 1020) + '…';
+  return text;
+}
+
 function makeUrlCacheKey(kind, url) {
   return `url:${kind}:${sha1(String(url || '').trim().toLowerCase())}`;
 }
@@ -1316,14 +1334,17 @@ bot.action(/^dl:(v|a):(.+)$/, async (ctx) => {
           BRAND_FOOTER,
           fallbackUrl,
           expectedHeight,
-          makeUrlCacheKey('video', url)
+          makeUrlCacheKey('video', url),
+          { originalUrl: entry.originalUrl || null }
         ),
         120_000
       );
       if (!ok) throw new Error('VIDEO_SEND_FAILED');
     } else {
       const ok = await withTimeout(
-        sendTelegramMedia(ctx, 'audio', url, BRAND_FOOTER, fallbackUrl, undefined, makeUrlCacheKey('audio', url)),
+        sendTelegramMedia(ctx, 'audio', url, BRAND_FOOTER, fallbackUrl, undefined, makeUrlCacheKey('audio', url), {
+          originalUrl: entry.originalUrl || null
+        }),
         120_000
       );
       if (!ok) throw new Error('AUDIO_SEND_FAILED');
@@ -1371,8 +1392,11 @@ bot.action(/^id:(.+)$/, async (ctx) => {
 	    const id = results?.[0]?.id;
 	    if (!id) throw new Error('No YouTube results found');
 	    const { mp3Url } = await downloadYouTubeMp3(id);
-	    await sendTelegramMedia(ctx, 'audio', mp3Url, `${fullQuery}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(id));
-	  } catch (err) {
+		    await sendTelegramMedia(ctx, 'audio', mp3Url, `${fullQuery}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(id), {
+          title: fullQuery || null,
+          originalUrl: id ? `https://youtu.be/${id}` : null
+        });
+		  } catch (err) {
     console.error('identify error:', err?.response?.data || err?.message || err);
     const status = err?.response?.status;
     if (status === 429 || err?.code === 'RAPIDAPI_LIMIT') {
@@ -1545,8 +1569,11 @@ bot.action(/^s:([^:]+):(\d+)$/, async (ctx) => {
       // Retry once: some providers return short-lived URLs.
       mp3Url = (await downloadYouTubeMp3(picked.id)).mp3Url;
     }
-    await sendTelegramMedia(ctx, 'audio', mp3Url, `${picked.title}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(picked.id));
-    try {
+	    await sendTelegramMedia(ctx, 'audio', mp3Url, `${picked.title}\n\n${BRAND_FOOTER}`, undefined, undefined, makeYouTubeMp3CacheKey(picked.id), {
+        title: picked.title || null,
+        originalUrl: picked.id ? `https://youtu.be/${picked.id}` : null
+      });
+	    try {
       // Remember the best pick for this query so next time we can send instantly from cache.
       const qKey = makeSearchQueryKey(entry.query, 'youtube');
       await upsertQueryBest({ queryKey: qKey, provider: 'youtube', bestId: picked.id });
@@ -1611,7 +1638,10 @@ bot.action(/^ya:(.+)$/, async (ctx) => {
   try {
     const { mp3Url } = await downloadYouTubeMp3(entry.id);
     const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
-    await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id));
+    await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id), {
+      title: entry.title || null,
+      originalUrl: entry.id ? `https://youtu.be/${entry.id}` : null
+    });
   } catch (err) {
     console.error('youtube audio download error:', err?.response?.data || err?.message || err);
     await ctx.reply("Audioni yuklab bo‘lmadi. Keyinroq urinib ko‘ring.");
@@ -1655,7 +1685,8 @@ bot.action(/^yv:(.+)$/, async (ctx) => {
       `${qLabel}\n${BRAND_FOOTER}`,
       undefined,
       qLabel,
-      makeYouTubeVideoCacheKey(entry.id, entry.quality)
+      makeYouTubeVideoCacheKey(entry.id, entry.quality),
+      { title: qLabel || null, originalUrl: entry.id ? `https://youtu.be/${entry.id}` : null }
     );
   } catch (err) {
     console.error(
@@ -1693,7 +1724,10 @@ bot.action(/^ya2:(.+)$/, async (ctx) => {
       return;
     }
     const caption = [entry.title || 'YouTube audio', '', BRAND_FOOTER].join('\n');
-    await sendTelegramMedia(ctx, 'audio', chosen, caption, undefined, undefined, makeYouTubeAudioCacheKey(entry.id, entry.quality));
+    await sendTelegramMedia(ctx, 'audio', chosen, caption, undefined, undefined, makeYouTubeAudioCacheKey(entry.id, entry.quality), {
+      title: entry.title || null,
+      originalUrl: entry.id ? `https://youtu.be/${entry.id}` : null
+    });
   } catch (err) {
     console.error(
       'youtube audio (quality) error:',
@@ -1740,7 +1774,10 @@ bot.action(/^ym:(.+)$/, async (ctx) => {
     }
     await loader.stop(null, true);
     const caption = [entry.title || 'YouTube MP3', '', BRAND_FOOTER].join('\n');
-    await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id));
+    await sendTelegramMedia(ctx, 'audio', mp3Url, caption, undefined, undefined, makeYouTubeMp3CacheKey(entry.id), {
+      title: entry.title || null,
+      originalUrl: entry.id ? `https://youtu.be/${entry.id}` : null
+    });
   } catch (err) {
     await loader.stop(null, true);
     console.error('youtube mp3 by id error:', err?.response?.data || err?.message || err);
@@ -1777,7 +1814,7 @@ async function waitUntilReady(urls, maxWaitMs) {
   return null;
 }
 
-async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight, cacheKeyOverride) {
+async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedHeight, cacheKeyOverride, storageMeta = null) {
   try {
     const u = new URL(String(url || ''));
     const host = (u.hostname || '').toLowerCase();
@@ -1819,7 +1856,7 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
     } else {
       sent = await ctx.replyWithAudio(url, { caption });
     }
-    await maybeCacheAndStore(ctx, kind, cacheKey, sent);
+    await maybeCacheAndStore(ctx, kind, cacheKey, sent, storageMeta);
     return true;
   } catch (err) {
     // Continue to fallback: download then upload.
@@ -1872,7 +1909,7 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
     } else {
       sent = await ctx.replyWithAudio({ source }, { caption });
     }
-    await maybeCacheAndStore(ctx, kind, cacheKey, sent);
+    await maybeCacheAndStore(ctx, kind, cacheKey, sent, storageMeta);
     return true;
   } catch (err) {
     if (err?.message === 'FILE_TOO_LARGE') {
@@ -1890,12 +1927,14 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
         );
         return false;
       }
-      if (fallbackUrl && fallbackUrl !== url) return await sendTelegramMedia(ctx, kind, fallbackUrl, caption, undefined, expectedHeight, cacheKey);
+      if (fallbackUrl && fallbackUrl !== url) {
+        return await sendTelegramMedia(ctx, kind, fallbackUrl, caption, undefined, expectedHeight, cacheKey, storageMeta);
+      }
       await ctx.reply("Bu format hozir ishlamayapti. Boshqa sifatni tanlang.");
       return false;
     }
     if (fallbackUrl && fallbackUrl !== url) {
-      return await sendTelegramMedia(ctx, kind, fallbackUrl, caption, undefined, expectedHeight, cacheKey);
+      return await sendTelegramMedia(ctx, kind, fallbackUrl, caption, undefined, expectedHeight, cacheKey, storageMeta);
     }
     throw err;
   } finally {
@@ -1945,6 +1984,16 @@ async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage, metaOverride
     try {
       const copied = await ctx.telegram.copyMessage(storageChatId, ctx.chat.id, sentMessage.message_id);
       storageMessageId = copied?.message_id || null;
+      // Optionally enrich the storage-channel caption with source details.
+      if (storageMessageId && metaOverride) {
+        try {
+          const cap = buildStorageCaption(kind, metaOverride);
+          // Works for video/audio/document messages copied to channels.
+          await ctx.telegram.editMessageCaption(storageChatId, storageMessageId, undefined, cap);
+        } catch (e) {
+          console.warn('storage caption edit failed:', e?.response?.description || e?.message || e);
+        }
+      }
       console.log('stored to channel:', { storageChatId, storageMessageId, kind, cacheKey });
     } catch (e) {
       console.error('copy to storage failed:', e?.response?.description || e?.message || e);
