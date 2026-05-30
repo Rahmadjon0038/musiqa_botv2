@@ -50,6 +50,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 const BRAND_FOOTER = '🤖 @Navobot_bot birinchi raqamli yuklovchi bot';
 const MAX_TELEGRAM_UPLOAD_BYTES = Number(process.env.MAX_TELEGRAM_UPLOAD_BYTES || 49 * 1024 * 1024);
 const STORAGE_CHAT_ID = process.env.STORAGE_CHAT_ID || process.env.STORAGE_CHANNEL_ID || null;
+const MUSIC_CHAT_ID = process.env.MUSIC_CHAT_ID || process.env.MUSIC_CHANNEL_ID || null;
 let BOT_USERNAME = process.env.BOT_USERNAME || null;
 let BOT_ID = process.env.BOT_ID ? Number(process.env.BOT_ID) : null;
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
@@ -86,6 +87,18 @@ function buildStorageCaption(kind, meta) {
 
   // Keep it simple and Telegram-friendly (caption limit is ~1024 chars for most media types).
   let text = [header, originalUrl, '', BRAND_FOOTER].filter(Boolean).join('\n');
+  if (text.length > 1024) text = text.slice(0, 1020) + '…';
+  return text;
+}
+
+function buildMusicCaption(meta, fallbackTitle = null) {
+  const m = meta && typeof meta === 'object' ? meta : null;
+  const title =
+    (m?.title || '').toString().trim() ||
+    (fallbackTitle || '').toString().trim() ||
+    '';
+  // Keep it short; captions for audio are limited.
+  let text = title || '🎵 Audio';
   if (text.length > 1024) text = text.slice(0, 1020) + '…';
   return text;
 }
@@ -565,6 +578,18 @@ bot.command('storageid', async (ctx) => {
   );
 });
 
+bot.command('musicid', async (ctx) => {
+  await ctx.reply(
+    [
+      "Music (audio arxiv) kanal ID sini olish:",
+      "1) Kanaldan istalgan postni botga FORWARD qiling (kanalda 'Protect content' yoqilmagan bo‘lsin).",
+      "2) Botni kanalda admin qiling va kanalda 'test' post yozing — bot logida kanal ID chiqadi.",
+      "",
+      "Keyin `.env` ga qo‘shasiz: MUSIC_CHAT_ID=-100..."
+    ].join('\n')
+  );
+});
+
 bot.command('myid', async (ctx) => {
   const id = ctx.from?.id;
   const username = ctx.from?.username || null;
@@ -654,7 +679,7 @@ bot.use(async (ctx, next) => {
   const forwarded = msg?.forward_from_chat;
   if (forwarded?.type === 'channel' && forwarded?.id) {
     await ctx.reply(
-      `Forward qilingan kanal ID: ${forwarded.id}\n.env ga qo‘shing: STORAGE_CHAT_ID=${forwarded.id}`
+      `Forward qilingan kanal ID: ${forwarded.id}\n.env ga qo‘shing: STORAGE_CHAT_ID=${forwarded.id} yoki MUSIC_CHAT_ID=${forwarded.id}`
     );
     return;
   }
@@ -667,6 +692,21 @@ bot.on('channel_post', async (ctx) => {
   if (chatId) {
     console.log('CHANNEL_POST chat.id:', chatId, 'title:', title || null);
   }
+});
+
+bot.on('my_chat_member', async (ctx) => {
+  const chat = ctx.chat;
+  if (!chat?.id) return;
+  const newStatus = ctx.update?.my_chat_member?.new_chat_member?.status || null;
+  const oldStatus = ctx.update?.my_chat_member?.old_chat_member?.status || null;
+  console.log('MY_CHAT_MEMBER:', {
+    chatId: chat.id,
+    type: chat.type || null,
+    title: chat.title || null,
+    username: chat.username || null,
+    oldStatus,
+    newStatus
+  });
 });
 
 bot.on('text', async (ctx) => {
@@ -2000,6 +2040,28 @@ async function maybeCacheAndStore(ctx, kind, cacheKey, sentMessage, metaOverride
     }
   }
 
+  // Optional: also collect ONLY audios (with title-only caption) into a separate private channel.
+  // This channel is not used as a DB/cache; it is just an archive for you.
+  const musicChatId = MUSIC_CHAT_ID ? String(MUSIC_CHAT_ID) : null;
+  if (kind === 'audio' && musicChatId) {
+    try {
+      const copied = await ctx.telegram.copyMessage(musicChatId, ctx.chat.id, sentMessage.message_id);
+      const musicMessageId = copied?.message_id || null;
+      if (musicMessageId) {
+        const fallbackTitle = sentMessage?.audio?.title || sentMessage?.audio?.file_name || null;
+        const cap = buildMusicCaption(metaOverride, fallbackTitle);
+        try {
+          await ctx.telegram.editMessageCaption(musicChatId, musicMessageId, undefined, cap);
+        } catch (e) {
+          console.warn('music caption edit failed:', e?.response?.description || e?.message || e);
+        }
+      }
+      console.log('copied to music channel:', { musicChatId, kind, cacheKey });
+    } catch (e) {
+      console.error('copy to music channel failed:', e?.response?.description || e?.message || e);
+    }
+  }
+
   try {
     await upsertMediaCache({
       cacheKey,
@@ -2028,6 +2090,7 @@ async function start() {
   await initDb();
   console.log('DB connected and users table is ready');
   console.log('Storage configured:', { STORAGE_CHAT_ID: STORAGE_CHAT_ID || null });
+  console.log('Music channel configured:', { MUSIC_CHAT_ID: MUSIC_CHAT_ID || null });
   console.log('Admin configured:', { adminCount: ADMIN_IDS.length });
 
   app.listen(PORT, () => {
