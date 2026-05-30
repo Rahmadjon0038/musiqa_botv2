@@ -98,7 +98,8 @@ function buildMusicCaption(meta, fallbackTitle = null) {
     (fallbackTitle || '').toString().trim() ||
     '';
   // Keep it short; captions for audio are limited.
-  let text = title || '🎵 Audio';
+  const header = title || '🎵 Audio';
+  let text = [header, '', BRAND_FOOTER].join('\n');
   if (text.length > 1024) text = text.slice(0, 1020) + '…';
   return text;
 }
