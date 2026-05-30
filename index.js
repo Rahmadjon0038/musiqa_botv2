@@ -160,7 +160,12 @@ async function trySendBestMp3ForQuery(ctx, query) {
     const mp3Cache = await getMediaCache(makeYouTubeMp3CacheKey(bestId));
     if (mp3Cache?.file_id) {
       const caption = [query, '', BRAND_FOOTER].join('\n');
-      return await trySendTelegramMediaByFileId(ctx, 'audio', mp3Cache.file_id, caption);
+      const sent = await trySendTelegramMediaByFileId(ctx, 'audio', mp3Cache.file_id, caption);
+      if (sent) {
+        await maybeCopyAudioToMusicChannel(ctx, sent, { title: query }, query);
+        return true;
+      }
+      return false;
     }
   } catch (e) {
     console.error('trySendBestMp3ForQuery failed:', e?.message || e);
@@ -1880,8 +1885,11 @@ async function sendTelegramMedia(ctx, kind, url, caption, fallbackUrl, expectedH
     try {
       const cached = await getMediaCache(cacheKey);
       if (cached?.file_id) {
-        const ok = await trySendTelegramMediaByFileId(ctx, kind, cached.file_id, caption);
-        if (ok) return true;
+        const sent = await trySendTelegramMediaByFileId(ctx, kind, cached.file_id, caption);
+        if (sent) {
+          await maybeCopyAudioToMusicChannel(ctx, sent, storageMeta, storageMeta?.title || null);
+          return true;
+        }
       }
     } catch (e) {
       console.error('cache lookup/send failed:', e?.message || e);
@@ -1997,17 +2005,39 @@ function extractFileIdFromMessage(kind, msg) {
   return null;
 }
 
+async function maybeCopyAudioToMusicChannel(ctx, sentMessage, metaOverride = null, fallbackTitle = null) {
+  const musicChatId = MUSIC_CHAT_ID ? String(MUSIC_CHAT_ID) : null;
+  if (!musicChatId) return false;
+  if (!sentMessage?.message_id) return false;
+  try {
+    const copied = await ctx.telegram.copyMessage(musicChatId, ctx.chat.id, sentMessage.message_id);
+    const musicMessageId = copied?.message_id || null;
+    if (musicMessageId) {
+      const cap = buildMusicCaption(metaOverride, fallbackTitle);
+      try {
+        await ctx.telegram.editMessageCaption(musicChatId, musicMessageId, undefined, cap);
+      } catch (e) {
+        console.warn('music caption edit failed:', e?.response?.description || e?.message || e);
+      }
+    }
+    console.log('copied to music channel:', { musicChatId, kind: 'audio' });
+    return true;
+  } catch (e) {
+    console.error('copy to music channel failed:', e?.response?.description || e?.message || e);
+    return false;
+  }
+}
+
 async function trySendTelegramMediaByFileId(ctx, kind, fileId, caption) {
   try {
     if (kind === 'video') {
-      await ctx.replyWithVideo(fileId, { caption });
+      return await ctx.replyWithVideo(fileId, { caption });
     } else {
-      await ctx.replyWithAudio(fileId, { caption });
+      return await ctx.replyWithAudio(fileId, { caption });
     }
-    return true;
   } catch (e) {
     console.error('file_id send failed:', e?.message || e);
-    return false;
+    return null;
   }
 }
 
